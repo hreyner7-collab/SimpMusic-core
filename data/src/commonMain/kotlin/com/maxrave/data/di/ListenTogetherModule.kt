@@ -53,6 +53,7 @@ val listenTogetherModule =
                 session = get(),
                 handler = get(),
                 scope = get<CoroutineScope>(named(Config.SERVICE_SCOPE)),
+                dataStoreManager = get(),
             ).also { it.start() }
         }
     }

@@ -537,40 +537,32 @@ internal class MediaServiceHandlerImpl(
                 launch {
                     simpleMediaState
                         .filter { it is SimpleMediaState.Progress }
-                        .map {
-                            val current = (it as SimpleMediaState.Progress).progress
-                            val duration = player.duration
-                            if (duration > 0L) {
-                                (current.toFloat() / player.duration) * 100
-                            } else {
-                                -1f
-                            }
-                        }.filter { it >= 0f }
-                        .distinctUntilChanged()
-                        .collect { current ->
+                        .collect { state ->
                             val categories = sponsorBlockCategories.value
-                            val skipSegments = skipSegments.value
-                            if (categories != null && player.duration > 0L && skipSegments != null) {
-                                for (skip in skipSegments) {
-                                    if (categories.contains(skip.category)) {
-                                        if (skip.segment.size < 2 || skip.videoDuration <= 0.0) {
-                                            continue
-                                        }
-                                        if (skip.segment[1] - skip.segment[0] < SPONSOR_BLOCK_MIN_SEGMENT_SECONDS) {
-                                            continue
-                                        }
-                                        val firstPart = ((skip.segment[0] / skip.videoDuration) * 100).toFloat()
-                                        val secondPart =
-                                            ((skip.segment[1] / skip.videoDuration) * 100).toFloat()
-                                        if (current in firstPart..secondPart) {
-                                            Logger.w(TAG, "Seek to $secondPart")
-                                            Logger.d(TAG, "Seek to Cr: $current, First: $firstPart, Second: $secondPart")
-                                            skipSegment(
-                                                ((secondPart * player.duration).toLong() / 100 + SPONSOR_BLOCK_SKIP_MARGIN_MS)
-                                                    .coerceIn(0L, player.duration),
-                                            )
-                                            showToast(ToastType.SponsorBlockSkip(skip.category))
-                                        }
+                            val segments = skipSegments.value
+                            if (categories == null || segments.isNullOrEmpty()) return@collect
+                            val duration = player.duration
+                            if (duration <= 0L) return@collect
+                            val current = ((state as SimpleMediaState.Progress).progress.toFloat() / duration) * 100f
+                            for (skip in segments) {
+                                if (categories.contains(skip.category)) {
+                                    if (skip.segment.size < 2 || skip.videoDuration <= 0.0) {
+                                        continue
+                                    }
+                                    if (skip.segment[1] - skip.segment[0] < SPONSOR_BLOCK_MIN_SEGMENT_SECONDS) {
+                                        continue
+                                    }
+                                    val firstPart = ((skip.segment[0] / skip.videoDuration) * 100).toFloat()
+                                    val secondPart =
+                                        ((skip.segment[1] / skip.videoDuration) * 100).toFloat()
+                                    if (current in firstPart..secondPart) {
+                                        Logger.w(TAG, "Seek to $secondPart")
+                                        Logger.d(TAG, "Seek to Cr: $current, First: $firstPart, Second: $secondPart")
+                                        skipSegment(
+                                            ((secondPart * duration).toLong() / 100 + SPONSOR_BLOCK_SKIP_MARGIN_MS)
+                                                .coerceIn(0L, duration),
+                                        )
+                                        showToast(ToastType.SponsorBlockSkip(skip.category))
                                     }
                                 }
                             }
@@ -1043,21 +1035,20 @@ internal class MediaServiceHandlerImpl(
                 // the beginning (#2152). The position is otherwise only saved on pause /
                 // track change / release, which misses uninterrupted background playback.
                 val positionPersistIntervalMs = 5_000L
-                // Named so the persist counter below cannot drift out of step with it, which is
-                // what a second hardcoded copy of the number did.
-                val tickIntervalMs = 50L
                 var sinceLastPositionSaveMs = 0L
                 while (true) {
+                    val tickIntervalMs =
+                        com.maxrave.domain.mediaservice.handler.PlaybackTimelinePrecision.currentTickIntervalMs()
                     delay(tickIntervalMs)
-                    _simpleMediaState.value = SimpleMediaState.Progress(player.currentPosition)
+                    val pos = player.currentPosition
+                    _simpleMediaState.value = SimpleMediaState.Progress(pos)
                     sinceLastPositionSaveMs += tickIntervalMs
                     if (sinceLastPositionSaveMs >= positionPersistIntervalMs) {
                         sinceLastPositionSaveMs = 0
                         mayBeSaveRecentPosition()
                         // Riding the existing 5s tick instead of adding one: the scrobble point is
-                        // half the track or four minutes, so five seconds of granularity is plenty
-                        // and the 100ms loop stays as cheap as it was.
-                        lastfmScrobbler.onProgress(player.currentPosition)
+                        // half the track or four minutes, so five seconds of granularity is plenty.
+                        lastfmScrobbler.onProgress(pos)
                     }
                 }
             }

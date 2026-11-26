@@ -5,6 +5,7 @@ import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.listentogether.RoomTrack
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
+import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
 import com.maxrave.domain.mediaservice.handler.QueueData
 import com.maxrave.domain.mediaservice.handler.SimpleMediaState
@@ -68,12 +69,14 @@ class ListenTogetherPlaybackBridge(
     private val session: ListenTogetherSession,
     private val handler: MediaPlayerHandler,
     private val scope: CoroutineScope,
+    private val dataStoreManager: DataStoreManager? = null,
 ) {
     private var started = false
     private var applyingRemote = false
     private var lastPublishedTrackId: String? = null
     private var lastAppliedTrackId: String? = null
     private var lastAppliedQueueIds: List<String> = emptyList()
+    private var lastPublishedVolume: Float = -1f
 
     /**
      * Whether the room was playing before the command currently being applied.
@@ -89,6 +92,7 @@ class ListenTogetherPlaybackBridge(
         Logger.i(TAG, "Playback bridge started")
         scope.launch { suppressCrossfadeWhileInRoom() }
         scope.launch { watchRoomForGuests() }
+        scope.launch { periodicDriftCheckForGuests() }
         scope.launch { resyncGuestOnResume() }
         scope.launch { publishCurrentStateOnJoin() }
         scope.launch { publishStateWhenSomeoneArrives() }
@@ -96,6 +100,8 @@ class ListenTogetherPlaybackBridge(
         scope.launch { publishTrackChangesAsHost() }
         scope.launch { publishPlayPauseAsHost() }
         scope.launch { publishSeeksAsHost() }
+        scope.launch { publishVolumeAsHost() }
+        scope.launch { followHostVolumeAsGuest() }
         scope.launch { answerBufferBarrier() }
     }
 
@@ -499,6 +505,87 @@ class ListenTogetherPlaybackBridge(
         }
     }
 
+    /**
+     * Continuous drift auto-correction for guests during long sessions.
+     * Every 12 seconds while playing in a room with a calibrated clock, checks whether the local
+     * playhead drifted beyond [PERIODIC_DRIFT_TOLERANCE_MS] from the server-predicted room timeline
+     * and gently seeks back into lockstep.
+     */
+    private suspend fun periodicDriftCheckForGuests() {
+        while (true) {
+            delay(PERIODIC_DRIFT_CHECK_MS)
+            val room = repository.room.value
+            if (!room.inRoom || room.isHost || !room.isPlaying || applyingRemote) continue
+            if (!session.isClockCalibrated()) continue
+            if (room.waitingFor.isNotEmpty()) continue
+            try {
+                withContext(Dispatchers.Main) {
+                    if (!handler.player.isPlaying || !handler.player.playWhenReady) return@withContext
+                    val expected = session.positionAt(room.position, isPlaying = true)
+                    val local = handler.player.currentPosition
+                    val drift = abs(local - expected)
+                    val duration = handler.player.duration
+                    if (drift in PERIODIC_DRIFT_TOLERANCE_MS..MAX_AUTO_DRIFT_CORRECTION_MS &&
+                        (duration <= 0L || expected < duration - 1_500L)
+                    ) {
+                        Logger.i(TAG, "Auto-correcting guest drift of ${drift}ms ($local -> $expected)")
+                        applyingRemote = true
+                        try {
+                            handler.player.seekTo(expected.coerceAtLeast(0L))
+                        } finally {
+                            applyingRemote = false
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.w(TAG, "Periodic drift check skipped: ${e.message}")
+            }
+        }
+    }
+
+    /** Host broadcasts volume adjustments so guests with Follow Host Volume stay matched. */
+    private suspend fun publishVolumeAsHost() {
+        handler.controlState
+            .map { it.volume }
+            .distinctUntilChanged()
+            .collect { volume ->
+                val state = repository.room.value
+                if (!state.inRoom || !state.isHost || applyingRemote) return@collect
+                if (lastPublishedVolume >= 0f && abs(volume - lastPublishedVolume) < 0.03f) return@collect
+                lastPublishedVolume = volume
+                session.sendVolume(volume)
+            }
+    }
+
+    /** Guest mirrors host volume whenever Follow Host Volume is enabled in Listen Together settings. */
+    private suspend fun followHostVolumeAsGuest() {
+        repository.room
+            .map { it.hostVolume }
+            .distinctUntilChanged()
+            .collect { hostVol ->
+                val targetVol = hostVol ?: return@collect
+                val room = repository.room.value
+                if (!room.inRoom || room.isHost || applyingRemote) return@collect
+                val followEnabled =
+                    dataStoreManager
+                        ?.getString(ListenTogetherPrefs.FOLLOW_HOST_VOLUME)
+                        ?.first()
+                        ?.let { !it.equals(ListenTogetherPrefs.FALSE, ignoreCase = true) }
+                        ?: true
+                if (!followEnabled) return@collect
+                runCatching {
+                    withContext(Dispatchers.Main) {
+                        applyingRemote = true
+                        try {
+                            handler.player.volume = targetVol.coerceIn(0f, 1f)
+                        } finally {
+                            applyingRemote = false
+                        }
+                    }
+                }
+            }
+    }
+
     // ─────────────────────────── the buffer barrier ───────────────────────────
 
     /**
@@ -570,5 +657,8 @@ class ListenTogetherPlaybackBridge(
          */
         const val SEEK_DETECT_MS = 2_500L
         const val READY_BUFFER_PERCENT = 5
+        const val PERIODIC_DRIFT_CHECK_MS = 12_000L
+        const val PERIODIC_DRIFT_TOLERANCE_MS = 1_500L
+        const val MAX_AUTO_DRIFT_CORRECTION_MS = 600_000L
     }
 }

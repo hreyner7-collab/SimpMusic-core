@@ -71,6 +71,12 @@ data class ListenTogetherState(
     val waitingFor: List<String> = emptyList(),
     /** Server time the last transport command was captured at; 0 when unknown. */
     val lastActionServerTime: Long = 0L,
+    /** Latest measured server round-trip latency in milliseconds; null until calibrated. */
+    val syncRttMs: Long? = null,
+    /** True once the server clock offset has been calibrated by a valid pong. */
+    val isClockCalibrated: Boolean = false,
+    /** Latest volume broadcast by the host (0f..1f), or null if the host has not sent one. */
+    val hostVolume: Float? = null,
     /**
      * The code we asked to join and have not heard back about.
      *
@@ -251,6 +257,22 @@ class ListenTogetherSession(
         )
     }
 
+    /** Publishes host volume (0f..1f) so guests with Follow Host Volume stay matched. */
+    fun sendVolume(volume: Float) =
+        launch {
+            client.send(
+                MessageTypes.PLAYBACK_ACTION,
+                PlaybackActionPayload(
+                    action = PlaybackActions.SET_VOLUME,
+                    volume = volume.coerceIn(0f, 1f),
+                    capturedAtServerTime = client.serverNow() ?: 0L,
+                ),
+            )
+        }
+
+    /** True once at least one pong has calibrated the room's clock. */
+    fun isClockCalibrated(): Boolean = client.isClockCalibrated()
+
     /** See `ServerClock.positionAt` — corrects a room position for time spent in flight. */
     fun positionAt(
         position: Long,
@@ -288,7 +310,11 @@ class ListenTogetherSession(
             is ListenTogetherEvent.Connected ->
                 _state.update { it.copy(connection = ConnectionState.Connected(event.serverVersion)) }
 
-            is ListenTogetherEvent.ClockReady -> Unit
+            is ListenTogetherEvent.ClockReady ->
+                _state.update { it.copy(isClockCalibrated = true, syncRttMs = client.syncRttMs() ?: it.syncRttMs) }
+
+            is ListenTogetherEvent.ClockUpdated ->
+                _state.update { it.copy(isClockCalibrated = true, syncRttMs = event.rttMs) }
 
             is ListenTogetherEvent.Disconnected ->
                 _state.update {
@@ -448,9 +474,25 @@ class ListenTogetherSession(
                                 PlaybackActions.PLAY -> true
                                 else -> it.isPlaying
                             },
-                        position = if (p.action == PlaybackActions.SYNC_QUEUE) it.position else p.position,
+                        position =
+                            if (p.action == PlaybackActions.SYNC_QUEUE || p.action == PlaybackActions.SET_VOLUME) {
+                                it.position
+                            } else {
+                                p.position
+                            },
                         queue = p.queue.ifEmpty { it.queue },
-                        lastActionServerTime = p.capturedAtServerTime,
+                        hostVolume =
+                            if (p.action == PlaybackActions.SET_VOLUME) {
+                                p.volume.coerceIn(0f, 1f)
+                            } else {
+                                it.hostVolume
+                            },
+                        lastActionServerTime =
+                            if (p.action == PlaybackActions.SET_VOLUME) {
+                                it.lastActionServerTime
+                            } else {
+                                p.capturedAtServerTime
+                            },
                     )
                 }
             }

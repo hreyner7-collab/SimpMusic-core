@@ -28,11 +28,13 @@ internal class ServerClock(
 
     private var serverOffsetMs: Double? = null
     private var bestRoundTripMs = Long.MAX_VALUE
+    private var lastRoundTripMs: Long? = null
 
     fun reset() =
         synchronized(lock) {
             serverOffsetMs = null
             bestRoundTripMs = Long.MAX_VALUE
+            lastRoundTripMs = null
         }
 
     /**
@@ -63,6 +65,7 @@ internal class ServerClock(
             val previousOffset = serverOffsetMs
 
             if (networkRoundTrip < bestRoundTripMs) bestRoundTripMs = networkRoundTrip
+            lastRoundTripMs = networkRoundTrip
             val weight = if (networkRoundTrip <= bestRoundTripMs + GOOD_SAMPLE_MARGIN_MS) 0.25 else 0.05
             serverOffsetMs = previousOffset?.let { it + weight * (sampleOffset - it) } ?: sampleOffset
             previousOffset == null
@@ -70,6 +73,12 @@ internal class ServerClock(
 
     /** Server wall time now, or null until a first pong has landed. */
     fun now(): Long? = synchronized(lock) { serverOffsetMs?.let { (elapsedRealtime() + it).toLong() } }
+
+    /** Most recent measured network round-trip time in milliseconds, or null before the first pong. */
+    fun roundTripMs(): Long? = synchronized(lock) { lastRoundTripMs }
+
+    /** True once at least one valid pong has calibrated the server clock offset. */
+    fun isCalibrated(): Boolean = synchronized(lock) { serverOffsetMs != null }
 
     /**
      * Where a track actually is, given where it was at [effectiveAtServerTime].

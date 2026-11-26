@@ -42,6 +42,7 @@ data class RoomTrack(
     val album: String = "",
     val durationMs: Long = 0L,
     val thumbnail: String = "",
+    val suggestedBy: String = "",
 )
 
 data class RoomSuggestion(
@@ -64,6 +65,12 @@ data class ListenTogetherRoom(
     val position: Long = 0L,
     /** Non-empty while the room is held at the buffer barrier. */
     val waitingFor: List<String> = emptyList(),
+    /** Latest measured server clock round-trip latency in milliseconds, or null before calibration. */
+    val syncRttMs: Long? = null,
+    /** True once the room clock offset is calibrated by a ping/pong round trip. */
+    val isClockCalibrated: Boolean = false,
+    /** Latest volume broadcast by the host (0f..1f), or null if unset. */
+    val hostVolume: Float? = null,
     /** The code we asked to join and have not heard back about. */
     val pendingJoinCode: String? = null,
     val error: String? = null,

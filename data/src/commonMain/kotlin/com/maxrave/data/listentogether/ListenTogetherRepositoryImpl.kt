@@ -120,6 +120,9 @@ private fun ListenTogetherState.toDomain() =
         isPlaying = isPlaying,
         position = position,
         waitingFor = waitingFor,
+        syncRttMs = syncRttMs,
+        isClockCalibrated = isClockCalibrated,
+        hostVolume = hostVolume,
         pendingJoinCode = pendingJoinCode,
         error = error,
     )
@@ -158,6 +161,7 @@ private fun TrackInfo.toDomain() =
         album = album,
         durationMs = duration,
         thumbnail = thumbnail,
+        suggestedBy = suggestedBy,
     )
 
 private fun RoomTrack.toProtocol() =
@@ -168,4 +172,5 @@ private fun RoomTrack.toProtocol() =
         album = album,
         duration = durationMs,
         thumbnail = thumbnail,
+        suggestedBy = suggestedBy,
     )

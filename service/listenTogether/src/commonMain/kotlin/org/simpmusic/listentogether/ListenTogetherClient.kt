@@ -72,6 +72,11 @@ sealed interface ListenTogetherEvent {
     /** The first pong landed, so [ListenTogetherClient.positionAt] now returns corrected values. */
     data object ClockReady : ListenTogetherEvent
 
+    /** Emitted on every valid pong with the latest measured round-trip latency in milliseconds. */
+    data class ClockUpdated(
+        val rttMs: Long,
+    ) : ListenTogetherEvent
+
     /**
      * The socket is down. [willRetry] false means this client has given up and the user has to
      * rejoin by hand — the retry budget is spent, or the server refused this client outright.
@@ -144,6 +149,12 @@ class ListenTogetherClient(
 
     /** Server wall time now, or null until the first pong has landed. */
     fun serverNow(): Long? = serverClock.now()
+
+    /** Latest measured server round-trip latency in milliseconds, or null before calibration. */
+    fun syncRttMs(): Long? = serverClock.roundTripMs()
+
+    /** True once server clock offset calibration has completed. */
+    fun isClockCalibrated(): Boolean = serverClock.isCalibrated()
 
     /** See [ServerClock.positionAt]. Falls back to [position] whenever the clock cannot help. */
     fun positionAt(
@@ -341,6 +352,9 @@ class ListenTogetherClient(
                 if (firstSample) {
                     Logger.i(TAG, "Server clock calibrated")
                     _events.emit(ListenTogetherEvent.ClockReady)
+                }
+                serverClock.roundTripMs()?.let { rtt ->
+                    _events.emit(ListenTogetherEvent.ClockUpdated(rtt))
                 }
                 return
             }
