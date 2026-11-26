@@ -80,6 +80,28 @@ class AiClient {
      * refused key or model is fixed in Settings, everything else is worth another try. The layers
      * above never see this library's own exception types.
      */
+    suspend fun djSuggest(prompt: String): Result<String> {
+        val service = aiService ?: return Result.failure(IllegalStateException("AI is not set up"))
+        return try {
+            service.djSuggest(prompt)?.let { Result.success(it) } ?: Result.failure(IllegalStateException("Empty answer"))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(friendlyAiError(e))
+        }
+    }
+
+    suspend fun djIntro(prompt: String): Result<String> {
+        val service = aiService ?: return Result.failure(IllegalStateException("AI is not set up"))
+        return try {
+            service.djIntro(prompt)?.let { Result.success(it) } ?: Result.failure(IllegalStateException("Empty answer"))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(friendlyAiError(e))
+        }
+    }
+
     suspend fun describeTaste(input: TasteInput): Result<TasteReading> {
         val service = aiService ?: return Result.failure(TasteException(TasteException.Kind.NOT_CONFIGURED))
         return try {
@@ -99,5 +121,22 @@ class AiClient {
     private companion object {
         /** Bad request, bad key, no access, unknown model: retrying cannot help, Settings can. */
         val REJECTED_STATUS = setOf(400, 401, 403, 404)
+    }
+}
+
+/**
+ * Some providers (Google's OpenAI-compatible endpoint among them) answer an error as a JSON list,
+ * `[{"error": {"code": 400, "message": "..."}}]`, which the OpenAI client cannot read and reports as
+ * "Expected start of the object". The provider's own message is in the text; this pulls it out, so a
+ * wrong key or model reads as what it is.
+ */
+internal fun friendlyAiError(e: Exception): Exception {
+    val text = e.message.orEmpty()
+    val provider = Regex("\"message\"\\s*:\\s*\"([^\"]{3,300})\"").find(text)?.groupValues?.get(1)
+    val code = Regex("\"code\"\\s*:\\s*(\\d{3})").find(text)?.groupValues?.get(1)
+    return when {
+        provider != null -> IllegalStateException("The AI provider refused the request" + (code?.let { " ($it)" } ?: "") + ": " + provider)
+        text.contains("Expected start of the object") -> IllegalStateException("The AI provider answered with an error. Check the API key and model in Settings > AI.")
+        else -> e
     }
 }

@@ -22,7 +22,7 @@ class SpotifyAuth(
         runCatching {
             val response = spotifyClient.getSpotifyLastestTotpSecret().body<Map<String, List<Int>>>()
             if (response.isNotEmpty()) {
-                val latestDict = response.entries.last()
+                val latestDict = response.entries.maxByOrNull { it.key.toIntOrNull() ?: Int.MIN_VALUE } ?: response.entries.last()
                 val firstKey = latestDict.key.toInt()
                 totpSecret = Pair(
                     firstKey,
@@ -38,6 +38,7 @@ class SpotifyAuth(
      */
     suspend fun refreshToken(spDc: String): Result<PersonalTokenResponse> =
         runCatching {
+            val cleanSpdc = spDc.substringAfter("sp_dc=", spDc).substringBefore(";").trim()
             if (totpSecret == null) {
                 // Fetch the latest TOTP secret if not already fetched
                 getTotpSecret().onSuccess {
@@ -47,7 +48,7 @@ class SpotifyAuth(
                 }
             }
             // Get server time from Spotify
-            val serverTimeResponse = spotifyClient.getSpotifyServerTime(spDc)
+            val serverTimeResponse = spotifyClient.getSpotifyServerTime(cleanSpdc)
             val serverTimeJson = Json.parseToJsonElement(serverTimeResponse.body<String>()).jsonObject
             val serverTime =
                 serverTimeJson["serverTime"]?.jsonPrimitive?.longOrNull
@@ -55,53 +56,39 @@ class SpotifyAuth(
             println("Server time: $serverTime")
 
             // Generate TOTP secret and OTP value
+            val totpVer = totpSecret?.first ?: SpotifyTotp.TOTP_SECRET_V22.first
             val otpValue = SpotifyTotp.at(serverTime * 1000L, totpSecret ?: SpotifyTotp.TOTP_SECRET_V22)
             println("Generated OTP: $otpValue")
 
             val sTime = "$serverTime"
             val cTime = "$serverTime"
 
-            // First try with transport mode
-            var response =
+            suspend fun fetchCandidate(reason: String, productType: String): PersonalTokenResponse? =
                 try {
                     spotifyClient.getSpotifyAccessToken(
-                        spdc = spDc,
+                        spdc = cleanSpdc,
                         otpValue = otpValue,
-                        reason = "transport",
+                        reason = reason,
                         sTime = sTime,
                         cTime = cTime,
-                        totpVersion = totpSecret?.first ?: SpotifyTotp.TOTP_SECRET_V22.first,
-                    )
+                        totpVersion = totpVer,
+                        productType = productType,
+                    ).body<PersonalTokenResponse>()
                 } catch (e: Exception) {
                     e.printStackTrace()
                     null
                 }
 
-            var tokenData =
-                try {
-                    response?.body<PersonalTokenResponse>()
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    null
-                }
-
-            // Check if token is valid (should be 374 characters)
-            if (tokenData?.accessToken?.length != 374) {
-                // Retry with init mode
-                response =
-                    spotifyClient.getSpotifyAccessToken(
-                        spdc = spDc,
-                        otpValue = otpValue,
-                        reason = "init",
-                        sTime = sTime,
-                        cTime = cTime,
-                        totpVersion = totpSecret?.first ?: SpotifyTotp.TOTP_SECRET_V22.first,
-                    )
-                tokenData = response.body<PersonalTokenResponse>()
+            var tokenData = fetchCandidate(reason = "transport", productType = "web-player")
+            if (tokenData == null || tokenData.accessToken.isBlank() || tokenData.isAnonymous) {
+                tokenData = fetchCandidate(reason = "init", productType = "web-player") ?: tokenData
+            }
+            if (tokenData == null || tokenData.accessToken.isBlank() || tokenData.isAnonymous) {
+                tokenData = fetchCandidate(reason = "init", productType = "mobile-web-player") ?: tokenData
             }
 
             // Validate token
-            if (tokenData.accessToken.isEmpty()) {
+            if (tokenData == null || tokenData.accessToken.isEmpty()) {
                 throw Exception("Unsuccessful token request")
             }
 

@@ -55,6 +55,8 @@ internal class SearchRepositoryImpl(
                         parseSearchSong(result).let { list ->
                             listSongs.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<SongsResult>>(ArrayList(listSongs)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -91,6 +93,8 @@ internal class SearchRepositoryImpl(
                         parseSearchVideo(result).let { list ->
                             listSongs.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<VideosResult>>(ArrayList(listSongs)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -129,6 +133,8 @@ internal class SearchRepositoryImpl(
                         parsePodcast(result.listPodcast).let { list ->
                             listPlaylist.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<PlaylistsResult>>(ArrayList(listPlaylist)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -164,6 +170,8 @@ internal class SearchRepositoryImpl(
                         parseSearchPlaylist(result).let { list ->
                             listPlaylist.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<PlaylistsResult>>(ArrayList(listPlaylist)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -199,6 +207,8 @@ internal class SearchRepositoryImpl(
                         parseSearchArtist(result).let { list ->
                             listArtist.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<ArtistsResult>>(ArrayList(listArtist)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -234,6 +244,8 @@ internal class SearchRepositoryImpl(
                         parseSearchAlbum(result).let { list ->
                             listAlbum.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<AlbumsResult>>(ArrayList(listAlbum)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube
@@ -269,6 +281,8 @@ internal class SearchRepositoryImpl(
                         parseSearchPlaylist(result).let { list ->
                             listPlaylist.addAll(list)
                         }
+                        // Speed: show page 1 immediately; continuation pages follow as a second emit.
+                        emit(Resource.Success<ArrayList<PlaylistsResult>>(ArrayList(listPlaylist)))
                         var count = 0
                         while (count < 2 && countinueParam != null) {
                             youTube

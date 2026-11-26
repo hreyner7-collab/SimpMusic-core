@@ -10,6 +10,13 @@ import java.util.Locale
 
 private const val TAG = "MpvPlayer"
 
+private const val MAX_RECENT_MESSAGES = 12
+
+private val URL_IN_MESSAGE = Regex("""https?://([^/\s"']+)[^\s"']*""")
+
+/** Keeps only the host of every URL in [text]; see [MpvPlayer.recentMpvMessages] for why. */
+private fun redactUrls(text: String): String = URL_IN_MESSAGE.replace(text) { "${it.groupValues[1]}/..." }
+
 /**
  * The two halves of the DJ-style filter sweep, mirroring `BiquadFilter.FilterType` on the Android
  * backend: during a crossfade the outgoing track gets a low-pass whose cutoff falls, and the
@@ -78,6 +85,135 @@ open class MpvPlayerEventAdapter {
     open fun opening(player: MpvPlayer) {}
 }
 
+interface MpvPlayerHandleEventListener {
+    fun finished(player: MpvPlayerHandle) {}
+
+    fun error(player: MpvPlayerHandle) {}
+
+    fun playing(player: MpvPlayerHandle) {}
+
+    fun restarted(player: MpvPlayerHandle) {}
+
+    fun seeking(player: MpvPlayerHandle) {}
+
+    fun paused(player: MpvPlayerHandle) {}
+
+    fun stopped(player: MpvPlayerHandle) {}
+
+    fun timeChanged(
+        player: MpvPlayerHandle,
+        newTimeMs: Long,
+    ) {}
+
+    fun lengthChanged(
+        player: MpvPlayerHandle,
+        newLengthMs: Long,
+    ) {}
+
+    fun buffering(
+        player: MpvPlayerHandle,
+        newCache: Float,
+    ) {}
+
+    fun opening(player: MpvPlayerHandle) {}
+}
+
+interface MpvPlayerHandle {
+    val videoFrames: MpvVideoFrameSource?
+    val isReleased: Boolean
+    val time: Long
+    val length: Long
+
+    /** mpv's own name for why the last file failed (for example "loading failed"), or null. */
+    val lastEndFileErrorText: String? get() = null
+
+    /** `mpv_event_end_file.error` of the last file that failed; 0 when none did. */
+    val lastEndFileError: Int get() = 0
+
+    /** The newest mpv warnings and errors for the file being played, oldest first. */
+    fun recentMpvMessages(): List<String> = emptyList()
+
+    fun setHandleEventListener(listener: MpvPlayerHandleEventListener?)
+
+    fun loadFile(
+        url: String,
+        startPaused: Boolean,
+        startMs: Long = 0L,
+    )
+
+    fun play()
+
+    fun pause()
+
+    fun stop()
+
+    fun seekTo(timeMs: Long)
+
+    fun setMasterVolume(volume: Int)
+
+    fun setFadeVolume(volume: Int)
+
+    fun setSleepFadeVolume(volume: Int)
+
+    fun setVolumeLevels(
+        master: Int,
+        sleep: Int,
+    )
+
+    fun setMute(mute: Boolean)
+
+    fun setRate(rate: Float)
+
+    fun setVideoSuspended(suspended: Boolean)
+
+    fun setAudioDevice(name: String)
+
+    fun audioDeviceListJson(): String?
+
+    fun audioDevice(): String?
+
+    fun currentAudioOutputDriver(): String?
+
+    fun installCrossfadeChain(
+        sweep: MpvCrossfadeFilter?,
+        sweepStartHz: Float,
+        pitchShift: Boolean,
+    ): MpvPlayer.CrossfadeChain
+
+    fun setCrossfadeCutoffHz(
+        sweep: MpvCrossfadeFilter,
+        hz: Float,
+    )
+
+    fun setPitchScale(scale: Float)
+
+    fun clearAudioFilters()
+
+    fun setEqualizer(
+        bandsDb: List<Float>,
+        preampDb: Float,
+    ): Boolean
+
+    fun setAudioEffects(
+        effects: AudioEffects,
+        reverbIrPath: String?,
+    ): Boolean
+
+    fun setReverbMix(mix: Float): Boolean
+
+    fun setEightD(
+        orbit: EightDOrbit?,
+        fadeOutEffect: EightDEffect? = null,
+        fadeIn: Boolean = false,
+    ): Boolean
+
+    fun syncEightD(): Boolean
+
+    fun setLooping(loop: Boolean)
+
+    fun release()
+}
+
 /**
  * Thin wrapper around one libmpv handle — the mpv counterpart of `VlcPlayer`.
  *
@@ -100,8 +236,8 @@ class MpvPlayer private constructor(
      * API and publishes finished frames for Compose to draw — the successor of the
      * `MpvVideoSurfacePanel` that Swing used to blit.
      */
-    val videoFrames: MpvVideoFrameSource? = null,
-) {
+    override val videoFrames: MpvVideoFrameSource? = null,
+) : MpvPlayerHandle {
     companion object {
         /**
          * The audio output driver every handle is pinned to, or null where mpv picks one itself.
@@ -147,6 +283,7 @@ class MpvPlayer private constructor(
          * change addresses — see [setReverbMix].
          */
         private const val FX_REVERB_LABEL = "simpFxReverb"
+        private const val FX_WIDE_LABEL = "simpFxWiden"
         private const val EIGHT_D_LABEL = "simp8D"
         private const val EIGHT_D_TEMPO_LABEL = "simp8DTempo"
         private const val SYNC_GUARD_NANOS = 500_000_000L
@@ -284,7 +421,25 @@ class MpvPlayer private constructor(
 
             // VLC "--network-caching=10000" / ":network-caching=15000".
             option("cache", "yes")
-            option("cache-secs", networkCacheSeconds.toString())
+            option("cache-secs", maxOf(networkCacheSeconds, 20).toString())
+            optionalOption("cache-pause", "no")
+            optionalOption("cache-pause-initial", "no")
+            optionalOption("demuxer-readahead-secs", "20")
+            optionalOption("demuxer-lavf-probesize", "32768")
+            optionalOption("demuxer-lavf-analyzeduration", "0.05")
+            optionalOption("audio-buffer", "0.20")
+            optionalOption("audio-exclusive", "no")
+            optionalOption("network-timeout", "15")
+            if (System.getProperty("os.name").orEmpty().contains("win", ignoreCase = true)) {
+                val driverFile = java.io.File(System.getProperty("user.home"), ".simpmusic/audio-driver.conf")
+                val driver =
+                    runCatching {
+                        if (driverFile.isFile) driverFile.readText().trim().lowercase() else ""
+                    }.getOrDefault("")
+                if (driver in setOf("wasapi", "winmm", "sdl")) {
+                    optionalOption("ao", driver)
+                }
+            }
 
             // cache-secs alone is only a target; the hard ceiling is demuxer-max-bytes, whose
             // default is 150 MB forward plus a back-buffer. Two handles exist at once during a
@@ -363,6 +518,12 @@ class MpvPlayer private constructor(
                 return null
             }
 
+            // Without this mpv never says WHY a file failed (HTTP 403, unknown format, audio device
+            // failure): the end-of-file event only carries a bare error code. Warnings and errors
+            // are kept per file and written out when playback fails. An old libmpv without the call
+            // just keeps today's behaviour.
+            runCatching { lib.mpv_request_log_messages(ctx, "warn") }
+
             // The render context must exist before the first loadfile — render.h: "The renderer
             // needs to be created with mpv_render_context_create() before you start playback (or
             // otherwise cause a VO to be created)", and "Video initialization will fail if the
@@ -394,7 +555,7 @@ class MpvPlayer private constructor(
     }
 
     @Volatile
-    var isReleased = false
+    override var isReleased = false
         private set
 
     @Volatile
@@ -404,6 +565,31 @@ class MpvPlayer private constructor(
     private var pumpRunning = true
 
     private var pumpThread: Thread? = null
+
+    /** `mpv_event_end_file.error` of the last file that ended in an error; 0 when none did. */
+    @Volatile
+    override var lastEndFileError: Int = 0
+        private set
+
+    /** mpv's own name for [lastEndFileError] (for example "loading failed"), or null. */
+    @Volatile
+    override var lastEndFileErrorText: String? = null
+        private set
+
+    private val recentMessages = ArrayDeque<String>()
+
+    /**
+     * The newest mpv warnings and errors for the file being played, oldest first. URLs are cut down
+     * to their host: a googlevideo address carries the listener's IP and a signed token.
+     */
+    override fun recentMpvMessages(): List<String> = synchronized(recentMessages) { recentMessages.toList() }
+
+    private fun rememberMpvMessage(line: String) {
+        synchronized(recentMessages) {
+            if (recentMessages.size >= MAX_RECENT_MESSAGES) recentMessages.removeFirst()
+            recentMessages.addLast(line)
+        }
+    }
 
     // ---- play/pause edge detection (see maybeEmitPlayState) ----
 
@@ -429,6 +615,7 @@ class MpvPlayer private constructor(
         pumpThread =
             Thread({ pumpLoop() }, "Mpv-Event-Pump").apply {
                 isDaemon = true
+                priority = Thread.MAX_PRIORITY
                 start()
             }
     }
@@ -445,6 +632,47 @@ class MpvPlayer private constructor(
 
     fun setEventListener(listener: MpvPlayerEventAdapter?) {
         eventListener = listener
+    }
+
+    override fun setHandleEventListener(listener: MpvPlayerHandleEventListener?) {
+        setEventListener(
+            if (listener == null) {
+                null
+            } else {
+                object : MpvPlayerEventAdapter() {
+                    override fun finished(player: MpvPlayer) = listener.finished(player)
+
+                    override fun error(player: MpvPlayer) = listener.error(player)
+
+                    override fun playing(player: MpvPlayer) = listener.playing(player)
+
+                    override fun restarted(player: MpvPlayer) = listener.restarted(player)
+
+                    override fun seeking(player: MpvPlayer) = listener.seeking(player)
+
+                    override fun paused(player: MpvPlayer) = listener.paused(player)
+
+                    override fun stopped(player: MpvPlayer) = listener.stopped(player)
+
+                    override fun timeChanged(
+                        player: MpvPlayer,
+                        newTimeMs: Long,
+                    ) = listener.timeChanged(player, newTimeMs)
+
+                    override fun lengthChanged(
+                        player: MpvPlayer,
+                        newLengthMs: Long,
+                    ) = listener.lengthChanged(player, newLengthMs)
+
+                    override fun buffering(
+                        player: MpvPlayer,
+                        newCache: Float,
+                    ) = listener.buffering(player, newCache)
+
+                    override fun opening(player: MpvPlayer) = listener.opening(player)
+                }
+            },
+        )
     }
 
     // ================= event pump =================
@@ -500,19 +728,42 @@ class MpvPlayer private constructor(
             MpvEventId.START_FILE -> {
                 playbackRestarted = false
                 lastEmittedPlaying = null
+                lastEndFileError = 0
+                lastEndFileErrorText = null
+                synchronized(recentMessages) { recentMessages.clear() }
                 listener?.opening(this)
+            }
+
+            MpvEventId.LOG_MESSAGE -> {
+                val data = event.data
+                if (data != null) {
+                    val message = MpvEventLogMessage(data).apply { read() }
+                    val prefix = message.prefix?.getString(0).orEmpty()
+                    val level = message.level?.getString(0).orEmpty()
+                    val text = message.text?.getString(0).orEmpty().trim()
+                    if (text.isNotEmpty()) {
+                        val line = redactUrls("[$prefix] $level: $text")
+                        rememberMpvMessage(line)
+                        // Errors reach the log files at once; warnings only when a file then fails.
+                        if (level == "error" || level == "fatal") {
+                            Logger.e(TAG, "mpv: $line")
+                        } else {
+                            Logger.d(TAG, "mpv: $line")
+                        }
+                    }
+                }
             }
 
             MpvEventId.END_FILE -> {
                 playbackRestarted = false
                 lastEmittedPlaying = null
                 val dataPtr = event.data
-                val reason =
-                    if (dataPtr == null) {
-                        MpvEndFileReason.QUIT
-                    } else {
-                        MpvEventEndFile(dataPtr).apply { read() }.reason
-                    }
+                val endFile = dataPtr?.let { MpvEventEndFile(it).apply { read() } }
+                val reason = endFile?.reason ?: MpvEndFileReason.QUIT
+                if (endFile != null && reason == MpvEndFileReason.ERROR) {
+                    lastEndFileError = endFile.error
+                    lastEndFileErrorText = lib.mpv_error_string(endFile.error)
+                }
                 when (reason) {
                     MpvEndFileReason.EOF -> listener?.finished(this)
                     MpvEndFileReason.ERROR -> listener?.error(this)
@@ -611,12 +862,14 @@ class MpvPlayer private constructor(
      * are unnecessary here regardless: one handle serves exactly one media item, so they are set
      * on the handle itself in [create] — the same role VLC's `:option` media arguments played.
      */
-    fun loadFile(
+    override fun loadFile(
         url: String,
         startPaused: Boolean,
-        startMs: Long = 0L,
+        startMs: Long,
     ) {
         if (isReleased) return
+        activeSweepFilter = null
+        activePitchShift = false
         playedSinceLoad = !startPaused
         setPropertyString("pause", if (startPaused) "yes" else "no")
         // `start` is read by the next loadfile, so it rides on the handle like the options in [create]:
@@ -625,7 +878,7 @@ class MpvPlayer private constructor(
         command("loadfile", url, "replace")
     }
 
-    fun play() {
+    override fun play() {
         if (isReleased) return
         if (!playedSinceLoad) {
             playedSinceLoad = true
@@ -638,12 +891,12 @@ class MpvPlayer private constructor(
         setPropertyString("pause", "no")
     }
 
-    fun pause() {
+    override fun pause() {
         if (isReleased) return
         setPropertyString("pause", "yes")
     }
 
-    fun stop() {
+    override fun stop() {
         if (isReleased) return
         command("stop")
     }
@@ -675,7 +928,7 @@ class MpvPlayer private constructor(
      *
      * @param volume 0..100, matching `VlcPlayer.setVolume`. mpv's `volume` is natively 0..100.
      */
-    fun setMasterVolume(volume: Int) {
+    override fun setMasterVolume(volume: Int) {
         if (isReleased) return
         synchronized(volumeLock) {
             masterPercent = volume.coerceIn(0, 100)
@@ -688,7 +941,7 @@ class MpvPlayer private constructor(
      * every handle registers under the same `audio-client-name`, so they share one `ao-volume` and
      * only the software volume can fade one track against another.
      */
-    fun setFadeVolume(volume: Int) {
+    override fun setFadeVolume(volume: Int) {
         if (isReleased) return
         synchronized(volumeLock) {
             fadePercent = volume.coerceIn(0, 100)
@@ -704,7 +957,7 @@ class MpvPlayer private constructor(
      * and the master reaches the device mixer, so it takes effect immediately instead of trailing
      * the audio-output buffer by a second or two — a ramp measured in seconds cannot afford that lag.
      */
-    fun setSleepFadeVolume(volume: Int) {
+    override fun setSleepFadeVolume(volume: Int) {
         if (isReleased) return
         synchronized(volumeLock) {
             sleepPercent = volume.coerceIn(0, 100)
@@ -720,7 +973,7 @@ class MpvPlayer private constructor(
      * since `ao-volume` is shared across handles that intermediate value is audible on whatever is
      * playing — a full-volume blip in the middle of a fade.
      */
-    fun setVolumeLevels(
+    override fun setVolumeLevels(
         master: Int,
         sleep: Int,
     ) {
@@ -751,12 +1004,12 @@ class MpvPlayer private constructor(
             }
         }
 
-    fun setMute(mute: Boolean) {
+    override fun setMute(mute: Boolean) {
         if (isReleased) return
         setPropertyString("mute", if (mute) "yes" else "no")
     }
 
-    fun setRate(rate: Float) {
+    override fun setRate(rate: Float) {
         if (isReleased) return
         setPropertyDouble("speed", rate.toDouble())
     }
@@ -783,7 +1036,7 @@ class MpvPlayer private constructor(
      * Only for handles that also carry audio. A video-only handle (a canvas) left with no track
      * would have nothing to play and end the file — pause those instead.
      */
-    fun setVideoSuspended(suspended: Boolean) {
+    override fun setVideoSuspended(suspended: Boolean) {
         if (isReleased || videoFrames == null) return
         setPropertyString("vid", if (suspended) "no" else "auto")
     }
@@ -792,19 +1045,19 @@ class MpvPlayer private constructor(
      * Send this handle's audio to the mpv device [name] — `"auto"` for the system default. mpv
      * reopens its audio output on the spot, so this can change mid-track.
      */
-    fun setAudioDevice(name: String) {
+    override fun setAudioDevice(name: String) {
         if (isReleased) return
         setPropertyString("audio-device", name)
     }
 
     /** `audio-device-list` as mpv prints it: a JSON array of `{name, description}`, every driver's devices together. */
-    fun audioDeviceListJson(): String? = if (isReleased) null else getPropertyString("audio-device-list")
+    override fun audioDeviceListJson(): String? = if (isReleased) null else getPropertyString("audio-device-list")
 
     /** The device this handle was told to use (`"auto"` unless set). */
-    fun audioDevice(): String? = if (isReleased) null else getPropertyString("audio-device")
+    override fun audioDevice(): String? = if (isReleased) null else getPropertyString("audio-device")
 
     /** The audio output driver this handle actually opened — null until its audio has started. */
-    fun currentAudioOutputDriver(): String? = if (isReleased) null else getPropertyString("current-ao")
+    override fun currentAudioOutputDriver(): String? = if (isReleased) null else getPropertyString("current-ao")
 
     // ================= DJ crossfade audio chain =================
     //
@@ -846,7 +1099,7 @@ class MpvPlayer private constructor(
      *   [setPitchScale]; `speed` alone never moves pitch (see [setPitchScale]).
      * @return which parts mpv actually accepted — see [CrossfadeChain].
      */
-    fun installCrossfadeChain(
+    override fun installCrossfadeChain(
         sweep: MpvCrossfadeFilter?,
         sweepStartHz: Float,
         pitchShift: Boolean,
@@ -857,6 +1110,8 @@ class MpvPlayer private constructor(
             return CrossfadeChain.NONE
         }
         if (applyCrossfadeChain(sweep, sweepStartHz, pitchShift)) {
+            activeSweepFilter = sweep
+            activePitchShift = pitchShift
             return CrossfadeChain(sweep = sweep != null, pitchShift = pitchShift)
         }
         // librubberband is an OPTIONAL build-time dependency of libmpv — this build reports
@@ -865,12 +1120,21 @@ class MpvPlayer private constructor(
         // ship with every FFmpeg, so drop the pitch stage rather than lose the sweep as well.
         if (pitchShift && sweep != null && applyCrossfadeChain(sweep, sweepStartHz, false)) {
             Logger.w(TAG, "rubberband unavailable; crossfade keeps the filter sweep without pitch match")
+            activeSweepFilter = sweep
+            activePitchShift = false
             return CrossfadeChain(sweep = true, pitchShift = false)
         }
         Logger.w(TAG, "Could not install the crossfade filter chain; falling back to a volume-only fade")
         clearAudioFilters()
         return CrossfadeChain.NONE
     }
+
+    /** Tracks which crossfade filter stages are actually live on this handle's `af` graph. */
+    @Volatile
+    private var activeSweepFilter: MpvCrossfadeFilter? = null
+
+    @Volatile
+    private var activePitchShift: Boolean = false
 
     /**
      * The equalizer entry, or null while the equalizer is off or flat.
@@ -919,7 +1183,7 @@ class MpvPlayer private constructor(
      *
      * @return false only when 8D has been refused here.
      */
-    fun syncEightD(): Boolean {
+    override fun syncEightD(): Boolean {
         val orbit = eightDOrbit
         if (eightDRejected || orbit == null || eightDFadeOutEffect != null) return !eightDRejected
         // Rewriting `af` while audio plays can itself issue a refresh seek (audio.c
@@ -933,10 +1197,10 @@ class MpvPlayer private constructor(
      * @param fadeIn fade in from dry even if a graph is installed: the audio heard just before is dry.
      * @return false only when 8D has been refused here.
      */
-    fun setEightD(
+    override fun setEightD(
         orbit: EightDOrbit?,
-        fadeOutEffect: EightDEffect? = null,
-        fadeIn: Boolean = false,
+        fadeOutEffect: EightDEffect?,
+        fadeIn: Boolean,
     ): Boolean {
         if (isReleased) return true
         if (eightDRejected) return orbit == null
@@ -1024,7 +1288,7 @@ class MpvPlayer private constructor(
      * octave-spaced bands overlap without leaving gaps or stacking into ripple. [preampDb] is a
      * plain gain in front: boosting bands without pulling the level down first is what clips.
      */
-    fun setEqualizer(
+    override fun setEqualizer(
         bandsDb: List<Float>,
         preampDb: Float,
     ): Boolean {
@@ -1066,7 +1330,7 @@ class MpvPlayer private constructor(
      *   filters to build it — reports false even though the write itself succeeded, because the
      *   caller's real question is whether the effect it just enabled is actually running.
      */
-    fun setAudioEffects(
+    override fun setAudioEffects(
         effects: AudioEffects,
         reverbIrPath: String?,
     ): Boolean {
@@ -1097,9 +1361,16 @@ class MpvPlayer private constructor(
         // "no echo entry" means one thing when the user wants an echo and another when they do not.
         val dropped = (delay != null && echoEntry == null) || (reverb != null && reverbEntry == null)
 
-        if (applyFxEntries(listOfNotNull(echoEntry, reverbEntry))) return !dropped
+        // extrastereo scales the difference between the channels: 1.0 is unchanged, higher is wider.
+        // It ships with every FFmpeg build, so it needs no fallback of its own.
+        val wideEntry =
+            effects.stereoWidth?.let {
+                "@$FX_WIDE_LABEL:lavfi=[extrastereo=m=${mpvNumber(it.coerceIn(1f, 3f))}:c=1]"
+            }
 
-        if (reverbEntry != null && applyFxEntries(listOfNotNull(echoEntry))) {
+        if (applyFxEntries(listOfNotNull(echoEntry, reverbEntry, wideEntry))) return !dropped
+
+        if (reverbEntry != null && applyFxEntries(listOfNotNull(echoEntry, wideEntry))) {
             reverbFiltersUnavailable = true
             Logger.w(TAG, "reverb unavailable: this libmpv build lacks afir/amovie/asplit/amix")
             return false
@@ -1126,7 +1397,7 @@ class MpvPlayer private constructor(
      * Same call shape as [setCrossfadeCutoffHz], including the explicit target: mpv's lavfi graph
      * also holds the `abuffer`/`abuffersink` endpoints, which answer any command with `ENOSYS`.
      */
-    fun setReverbMix(mix: Float): Boolean {
+    override fun setReverbMix(mix: Float): Boolean {
         if (isReleased) return false
         return command("af-command", FX_REVERB_LABEL, "weights", reverbWeights(mix), "amix")
     }
@@ -1169,11 +1440,11 @@ class MpvPlayer private constructor(
      * mpv's lavfi graph also holds the `abuffer`/`abuffersink` endpoints, which answer any command
      * with `ENOSYS` and would make an otherwise successful retune report failure.
      */
-    fun setCrossfadeCutoffHz(
+    override fun setCrossfadeCutoffHz(
         sweep: MpvCrossfadeFilter,
         hz: Float,
     ) {
-        if (isReleased) return
+        if (isReleased || activeSweepFilter != sweep) return
         command("af-command", SWEEP_LABEL, "frequency", mpvNumber(hz), sweep.lavfiName)
     }
 
@@ -1194,8 +1465,8 @@ class MpvPlayer private constructor(
      * v0.37.0 af.rst:223 ``set-pitch`` — *"Set the <pitch-scale> argument dynamically … Note that
      * speed is controlled using the standard ``speed`` property, not ``af-command``."*
      */
-    fun setPitchScale(scale: Float) {
-        if (isReleased) return
+    override fun setPitchScale(scale: Float) {
+        if (isReleased || !activePitchShift) return
         command("af-command", PITCH_LABEL, "set-pitch", mpvNumber(scale))
     }
 
@@ -1205,8 +1476,10 @@ class MpvPlayer private constructor(
      * This is also what resets pitch: removing `rubberband` removes the pitch shift with it, so
      * callers only have to restore [setRate] afterwards.
      */
-    fun clearAudioFilters() {
+    override fun clearAudioFilters() {
         if (isReleased) return
+        activeSweepFilter = null
+        activePitchShift = false
         // Drops the crossfade tier only. This used to blank the whole property, which took the
         // equalizer down with it at the end of every transition.
         crossfadeEntries = emptyList()
@@ -1221,13 +1494,13 @@ class MpvPlayer private constructor(
      * approach — because looping natively replays from the demuxer cache instead of refetching
      * the whole URL on every repeat.
      */
-    fun setLooping(loop: Boolean) {
+    override fun setLooping(loop: Boolean) {
         if (isReleased) return
         setPropertyString("loop-file", if (loop) "inf" else "no")
     }
 
     /** @param timeMs milliseconds, matching `VlcPlayer.seekTo`. mpv's `time-pos` is seconds. */
-    fun seekTo(timeMs: Long) {
+    override fun seekTo(timeMs: Long) {
         if (isReleased) return
         // The seek's reset rebuilds the 8D graph from its string with n = 0 (see [syncEightD]).
         // Writing the live phase first makes that rebuild start on it, before any audio refills.
@@ -1236,11 +1509,11 @@ class MpvPlayer private constructor(
     }
 
     /** Current position in milliseconds, or 0. Mirrors `VlcPlayer.time`. */
-    val time: Long
+    override val time: Long
         get() = if (isReleased) 0L else secondsToMs(getPropertyDouble("time-pos"))
 
     /** Duration in milliseconds, or 0. Mirrors `VlcPlayer.length`. */
-    val length: Long
+    override val length: Long
         get() = if (isReleased) 0L else secondsToMs(getPropertyDouble("duration"))
 
     // ================= teardown =================
@@ -1259,7 +1532,7 @@ class MpvPlayer private constructor(
      * `mpv_terminate_destroy` (which blocks until the core is gone) would otherwise stall the
      * single service thread that drives playback.
      */
-    fun release() {
+    override fun release() {
         if (isReleased) return
         isReleased = true
         eventListener = null

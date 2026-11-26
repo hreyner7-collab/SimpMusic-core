@@ -75,9 +75,9 @@ data class BrowseResponse(
     ) {
         @Serializable
         data class GridContinuation(
-            val itemSize: String?,
-            val items: List<GridContinuation.Item>,
-            val continuations: List<Continuation>?,
+            val itemSize: String? = null,
+            val items: List<GridContinuation.Item> = emptyList(),
+            val continuations: List<Continuation>? = null,
         ) {
             @Serializable
             data class Item(
@@ -87,14 +87,14 @@ data class BrowseResponse(
 
         @Serializable
         data class SectionListContinuation(
-            val contents: List<SectionListRenderer.Content>,
-            val continuations: List<Continuation>?,
+            val contents: List<SectionListRenderer.Content> = emptyList(),
+            val continuations: List<Continuation>? = null,
         )
 
         @Serializable
         data class MusicPlaylistShelfContinuation(
-            val contents: List<MusicShelfRenderer.Content>,
-            val continuations: List<Continuation>?,
+            val contents: List<MusicShelfRenderer.Content> = emptyList(),
+            val continuations: List<Continuation>? = null,
         )
     }
 

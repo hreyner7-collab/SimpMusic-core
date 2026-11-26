@@ -10,37 +10,45 @@ import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import java.io.IOException
 import java.net.Proxy
+import java.util.concurrent.TimeUnit
 
 internal fun List<Pair<Int, String>>.hasRequiredItags(): Boolean {
     val itags = this.mapTo(HashSet()) { it.first }
-    val hasAudio = ITAG.AUDIO.any { it in itags }
-    val hasVideo = ITAG.VIDEO.any { it in itags }
-    return hasAudio && hasVideo
+    return ITAG.AUDIO.any { it in itags }
 }
 
 private val streamHealthCheckClient: OkHttpClient by lazy {
     OkHttpClient
         .Builder()
+        .connectTimeout(3500, TimeUnit.MILLISECONDS)
+        .readTimeout(3500, TimeUnit.MILLISECONDS)
+        .callTimeout(4500, TimeUnit.MILLISECONDS)
         .build()
 }
 
 /**
- * Pick one random URL whose itag belongs to [ITAG.AUDIO] or [ITAG.VIDEO] and HEAD it. Returns true
- * only when the response code is in the 200..299 range. We only health-check those URLs because
- * they are the ones the player will actually use; lower-quality extras can stay unverified.
+ * Pick one audio URL (or video URL if absent) and verify a real 64 KB byte-range GET (`bytes=0-65535`)
+ * returns 2xx with actual media payload bytes (`>= 64` bytes). `googlevideo.com` can answer `200` to
+ * `HEAD` and `206` to `bytes=0-0` on URLs that immediately 403 on real playback chunks.
  */
 internal fun List<Pair<Int, String>>.headCheckRandomStream(): Boolean {
-    val required = ITAG.AUDIO + ITAG.VIDEO
-    val candidate = this.filter { it.first in required }.randomOrNull() ?: return false
+    val candidate =
+        this.firstOrNull { it.first in ITAG.AUDIO }
+            ?: this.firstOrNull { it.first in ITAG.VIDEO }
+            ?: return false
     return runCatching {
         val request =
             okhttp3.Request
                 .Builder()
-                .head()
+                .get()
                 .url(candidate.second)
+                .header("Range", "bytes=0-65535")
                 .build()
         streamHealthCheckClient.newCall(request).execute().use { response ->
-            response.code in 200..299
+            if (response.code !in 200..299) return@use false
+            val source = response.body?.source() ?: return@use false
+            source.request(64)
+            source.buffer.size >= 64L
         }
     }.getOrDefault(false)
 }
@@ -52,6 +60,9 @@ class BraveNewPipeDownloaderImpl(
         OkHttpClient
             .Builder()
             .proxy(proxy)
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
             .build()
 
     @Throws(IOException::class, ReCaptchaException::class)
@@ -79,17 +90,14 @@ class BraveNewPipeDownloaderImpl(
             }
         }
 
-        val response = client.newCall(requestBuilder.build()).execute()
+        return client.newCall(requestBuilder.build()).execute().use { response ->
+            if (response.code == 429) {
+                throw ReCaptchaException("reCaptcha Challenge requested", url)
+            }
 
-        if (response.code == 429) {
-            response.close()
-
-            throw ReCaptchaException("reCaptcha Challenge requested", url)
+            val responseBodyToReturn = response.body?.string() ?: ""
+            val latestUrl = response.request.url.toString()
+            Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, latestUrl)
         }
-
-        val responseBodyToReturn = response.body?.string()
-
-        val latestUrl = response.request.url.toString()
-        return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, latestUrl)
     }
 }

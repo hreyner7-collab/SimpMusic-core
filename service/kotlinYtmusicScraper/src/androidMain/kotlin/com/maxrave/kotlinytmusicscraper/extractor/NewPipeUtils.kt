@@ -17,6 +17,7 @@ import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.Proxy
+import java.util.concurrent.TimeUnit
 
 class NewPipeDownloaderImpl(
     proxy: Proxy?,
@@ -25,19 +26,19 @@ class NewPipeDownloaderImpl(
         OkHttpClient
             .Builder()
             .proxy(proxy)
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
             .build()
 
     @Throws(IOException::class, ReCaptchaException::class)
-    override fun execute(request: Request): Response {
-        val response = client.newCall(buildOkHttpRequest(request)).execute()
-
-        if (response.code == 429) {
-            response.close()
-            throw ReCaptchaException("reCaptcha Challenge requested", request.url())
+    override fun execute(request: Request): Response =
+        client.newCall(buildOkHttpRequest(request)).execute().use { response ->
+            if (response.code == 429) {
+                throw ReCaptchaException("reCaptcha Challenge requested", request.url())
+            }
+            response.toNewPipeResponse()
         }
-
-        return response.toNewPipeResponse()
-    }
 
     @Throws(IOException::class, ReCaptchaException::class)
     override fun executeAsync(

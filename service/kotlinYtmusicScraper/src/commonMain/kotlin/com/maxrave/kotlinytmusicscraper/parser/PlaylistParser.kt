@@ -202,6 +202,31 @@ fun BrowseResponse.getContinuePlaylistContinuation(): String? =
         ?.continuations
         ?.getContinuation()
 
+private fun com.maxrave.kotlinytmusicscraper.models.NavigationEndpoint?.extractWatchOrPlaylistEndpoint(): WatchEndpoint? =
+    this?.watchPlaylistEndpoint ?: this?.watchEndpoint
+
+private fun List<com.maxrave.kotlinytmusicscraper.models.Button>?.findHeaderActionEndpoint(iconType: String): WatchEndpoint? {
+    if (this == null) return null
+    for (btn in this) {
+        val renderer = btn.buttonRenderer
+        if (renderer?.icon?.iconType == iconType) {
+            val ep =
+                renderer.navigationEndpoint.extractWatchOrPlaylistEndpoint()
+                    ?: renderer.command.extractWatchOrPlaylistEndpoint()
+            if (ep != null) return ep
+        }
+    }
+    for (btn in this) {
+        val item =
+            btn.menuRenderer?.items?.find {
+                it.menuNavigationItemRenderer?.icon?.iconType == iconType
+            }?.menuNavigationItemRenderer
+        val ep = item?.navigationEndpoint.extractWatchOrPlaylistEndpoint()
+        if (ep != null) return ep
+    }
+    return null
+}
+
 fun BrowseResponse.getPlaylistRadioEndpoint(): WatchEndpoint? {
     val header =
         this.header?.musicDetailHeaderRenderer
@@ -210,35 +235,20 @@ fun BrowseResponse.getPlaylistRadioEndpoint(): WatchEndpoint? {
                 ?.header
                 ?.musicDetailHeaderRenderer
     if (header != null) {
+        header.menu.menuRenderer.topLevelButtons
+            ?.find { it.buttonRenderer?.icon?.iconType == "MIX" }
+            ?.buttonRenderer
+            ?.let { it.navigationEndpoint.extractWatchOrPlaylistEndpoint() ?: it.command.extractWatchOrPlaylistEndpoint() }
+            ?.let { return it }
         return header.menu.menuRenderer.items
             .find {
                 it.menuNavigationItemRenderer?.icon?.iconType == "MIX"
             }?.menuNavigationItemRenderer
             ?.navigationEndpoint
-            ?.watchPlaylistEndpoint
+            .extractWatchOrPlaylistEndpoint()
     } else {
-        return this.contents
-            ?.twoColumnBrowseResultsRenderer
-            ?.tabs
-            ?.firstOrNull()
-            ?.tabRenderer
-            ?.content
-            ?.sectionListRenderer
-            ?.contents
-            ?.firstOrNull()
-            ?.musicEditablePlaylistDetailHeaderRenderer
-            ?.header
-            ?.musicResponsiveHeaderRenderer
-            ?.buttons
-            ?.lastOrNull()
-            ?.menuRenderer
-            ?.items
-            ?.find {
-                it.menuNavigationItemRenderer?.icon?.iconType == "MIX"
-            }?.menuNavigationItemRenderer
-            ?.navigationEndpoint
-            ?.watchPlaylistEndpoint
-            ?: this.contents
+        val responsiveButtons =
+            this.contents
                 ?.twoColumnBrowseResultsRenderer
                 ?.tabs
                 ?.firstOrNull()
@@ -247,16 +257,11 @@ fun BrowseResponse.getPlaylistRadioEndpoint(): WatchEndpoint? {
                 ?.sectionListRenderer
                 ?.contents
                 ?.firstOrNull()
-                ?.musicResponsiveHeaderRenderer
-                ?.buttons
-                ?.findLast { it.menuRenderer != null }
-                ?.menuRenderer
-                ?.items
-                ?.find {
-                    it.menuNavigationItemRenderer?.icon?.iconType == "MIX"
-                }?.menuNavigationItemRenderer
-                ?.navigationEndpoint
-                ?.watchPlaylistEndpoint
+                ?.let { content ->
+                    content.musicEditablePlaylistDetailHeaderRenderer?.header?.musicResponsiveHeaderRenderer?.buttons
+                        ?: content.musicResponsiveHeaderRenderer?.buttons
+                }
+        return responsiveButtons.findHeaderActionEndpoint("MIX")
     }
 }
 
@@ -268,34 +273,25 @@ fun BrowseResponse.getPlaylistShuffleEndpoint(): WatchEndpoint? {
                 ?.header
                 ?.musicDetailHeaderRenderer
     if (header != null) {
+        header.menu.menuRenderer.topLevelButtons
+            ?.find { it.buttonRenderer?.icon?.iconType == "MUSIC_SHUFFLE" }
+            ?.buttonRenderer
+            ?.let { it.navigationEndpoint.extractWatchOrPlaylistEndpoint() ?: it.command.extractWatchOrPlaylistEndpoint() }
+            ?.let { return it }
+        header.menu.menuRenderer.items
+            .find { it.menuNavigationItemRenderer?.icon?.iconType == "MUSIC_SHUFFLE" }
+            ?.menuNavigationItemRenderer
+            ?.navigationEndpoint
+            .extractWatchOrPlaylistEndpoint()
+            ?.let { return it }
         return header.menu.menuRenderer.topLevelButtons
             ?.firstOrNull()
             ?.buttonRenderer
             ?.navigationEndpoint
-            ?.watchPlaylistEndpoint
+            .extractWatchOrPlaylistEndpoint()
     } else {
-        return this.contents
-            ?.twoColumnBrowseResultsRenderer
-            ?.tabs
-            ?.firstOrNull()
-            ?.tabRenderer
-            ?.content
-            ?.sectionListRenderer
-            ?.contents
-            ?.firstOrNull()
-            ?.musicEditablePlaylistDetailHeaderRenderer
-            ?.header
-            ?.musicResponsiveHeaderRenderer
-            ?.buttons
-            ?.lastOrNull()
-            ?.menuRenderer
-            ?.items
-            ?.find {
-                it.menuNavigationItemRenderer?.icon?.iconType == "MUSIC_SHUFFLE"
-            }?.menuNavigationItemRenderer
-            ?.navigationEndpoint
-            ?.watchPlaylistEndpoint
-            ?: this.contents
+        val responsiveButtons =
+            this.contents
                 ?.twoColumnBrowseResultsRenderer
                 ?.tabs
                 ?.firstOrNull()
@@ -304,16 +300,11 @@ fun BrowseResponse.getPlaylistShuffleEndpoint(): WatchEndpoint? {
                 ?.sectionListRenderer
                 ?.contents
                 ?.firstOrNull()
-                ?.musicResponsiveHeaderRenderer
-                ?.buttons
-                ?.findLast { it.menuRenderer != null }
-                ?.menuRenderer
-                ?.items
-                ?.find {
-                    it.menuNavigationItemRenderer?.icon?.iconType == "MUSIC_SHUFFLE"
-                }?.menuNavigationItemRenderer
-                ?.navigationEndpoint
-                ?.watchPlaylistEndpoint
+                ?.let { content ->
+                    content.musicEditablePlaylistDetailHeaderRenderer?.header?.musicResponsiveHeaderRenderer?.buttons
+                        ?: content.musicResponsiveHeaderRenderer?.buttons
+                }
+        return responsiveButtons.findHeaderActionEndpoint("MUSIC_SHUFFLE")
     }
 }
 

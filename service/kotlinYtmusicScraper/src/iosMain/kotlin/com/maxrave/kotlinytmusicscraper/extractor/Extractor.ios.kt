@@ -7,6 +7,10 @@ actual class Extractor {
     actual fun init() {
     }
 
+    actual fun warmUp() {}
+
+    actual fun invalidateDecoder() {}
+
     actual fun logIn(cookie: String?) {}
 
     actual fun newPipePlayer(videoId: String): List<Pair<Int, String>> = emptyList()

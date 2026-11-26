@@ -10,8 +10,8 @@ data class Button(
     @Serializable
     data class ButtonRenderer(
         val text: Runs? = null,
-        val navigationEndpoint: NavigationEndpoint?,
-        val command: NavigationEndpoint?,
-        val icon: Icon?,
+        val navigationEndpoint: NavigationEndpoint? = null,
+        val command: NavigationEndpoint? = null,
+        val icon: Icon? = null,
     )
 }

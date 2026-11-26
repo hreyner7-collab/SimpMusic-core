@@ -50,6 +50,7 @@ import com.maxrave.common.Config.SERVICE_SCOPE
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.extension.now
+import com.maxrave.domain.extension.plusSeconds
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.mediaservice.handler.DownloadHandler
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
@@ -325,6 +326,7 @@ private fun provideResolvingDataSourceFactory(
         var dataSpecReturn: DataSpec = dataSpec
         var resolved = false
         runBlocking(Dispatchers.IO) {
+            kotlinx.coroutines.withTimeoutOrNull(20_000L) {
             if (mediaId.contains(MERGING_DATA_TYPE.VIDEO)) {
                 val id = mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
                 streamRepository.getNewFormat(id).lastOrNull()?.let {
@@ -332,12 +334,13 @@ private fun provideResolvingDataSourceFactory(
                     if (videoUrl != null && it.expiredTime > now()) {
                         Logger.d("Stream", videoUrl)
                         Logger.d("Stream", "Video from format")
-                        val is403Url = streamRepository.is403Url(videoUrl).firstOrNull() != false
-                        Logger.d("Stream", "is 403 $is403Url")
+                        val formatFresh = it.expiredTime > now().plusSeconds(120)
+                        val is403Url = if (formatFresh) false else (streamRepository.is403Url(videoUrl).firstOrNull() != false)
+                        Logger.d("Stream", "is 403 $is403Url (fresh=$formatFresh)")
                         if (!is403Url) {
-                            dataSpecReturn = dataSpec.withUri(videoUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                            dataSpecReturn = dataSpec.withUri(stripConflictingRangeQuery(videoUrl).toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
                             resolved = true
-                            return@runBlocking
+                            return@withTimeoutOrNull
                         }
                     }
                 }
@@ -351,21 +354,22 @@ private fun provideResolvingDataSourceFactory(
                     ?.let {
                         Logger.d("Stream", it)
                         Logger.d("Stream", "Video")
-                        dataSpecReturn = dataSpec.withUri(it.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                        dataSpecReturn = dataSpec.withUri(stripConflictingRangeQuery(it).toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
                         resolved = true
                     }
             } else {
-                streamRepository.getNewFormat(mediaId).lastOrNull()?.let {
+                streamRepository.getMatchingNewFormat(mediaId, dataStoreManager)?.let {
                     val audioUrl = it.audioUrl
                     if (audioUrl != null && it.expiredTime > now()) {
                         Logger.d("Stream", audioUrl)
                         Logger.d("Stream", "Audio from format")
-                        val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
-                        Logger.d("Stream", "is 403 $is403Url")
+                        val formatFresh = it.expiredTime > now().plusSeconds(120)
+                        val is403Url = if (formatFresh) false else (streamRepository.is403Url(audioUrl).firstOrNull() != false)
+                        Logger.d("Stream", "is 403 $is403Url (fresh=$formatFresh)")
                         if (!is403Url) {
-                            dataSpecReturn = dataSpec.withUri(audioUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                            dataSpecReturn = dataSpec.withUri(stripConflictingRangeQuery(audioUrl).toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
                             resolved = true
-                            return@runBlocking
+                            return@withTimeoutOrNull
                         }
                     }
                 }
@@ -379,16 +383,17 @@ private fun provideResolvingDataSourceFactory(
                     ?.let {
                         Logger.d("Stream", it)
                         Logger.d("Stream", "Audio")
-                        dataSpecReturn = dataSpec.withUri(it.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                        dataSpecReturn = dataSpec.withUri(stripConflictingRangeQuery(it).toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
                         resolved = true
                     }
+            }
             }
         }
         // getStream above is where a live broadcast is first recognised. Its HLS playlist URL must
         // not be read as a file, so this source fails and the track is rebuilt as HLS.
         if (LiveStreamRegistry.isLive(videoId)) throw LiveStreamDetectedException(videoId)
         if (!resolved) {
-            Logger.e("Stream", "Failed to resolve stream URL for $mediaId")
+            Logger.w("Stream", "Failed to resolve stream URL for $mediaId")
             throw java.io.IOException("Failed to resolve stream URL for $mediaId")
         }
         return@Factory dataSpecReturn
@@ -545,7 +550,40 @@ private fun provideCacheDataSource(
         ).setCacheWriteDataSinkFactory(null)
         .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-/** The network underneath every player source: OkHttp behind the user's proxy, with header logging. */
+private val RANGE_QUERY_REGEX = Regex("([?&])range=0-\\d+(&?)")
+
+/**
+ * Removes `&range=0-...` from progressive `googlevideo.com` URLs before Media3 attaches its own
+ * `DataSpec.subrange(...)` (`Range: bytes=...` HTTP header), so chunk boundaries and seeks never
+ * carry a conflicting URL `range=` parameter alongside the HTTP `Range` header.
+ */
+private fun stripConflictingRangeQuery(url: String): String {
+    if (!url.contains("range=0-") || url.contains(".m3u8") || url.contains(".mpd")) return url
+    return RANGE_QUERY_REGEX
+        .replace(url) { match ->
+            val leading = match.groupValues[1]
+            val trailing = match.groupValues[2]
+            when {
+                leading == "?" && trailing == "&" -> "?"
+                leading == "&" && trailing == "&" -> "&"
+                else -> ""
+            }
+        }.trimEnd('?', '&')
+}
+
+private fun userAgentForStreamUrl(url: String): String {
+    val client = Regex("[?&]c=([^&]+)").find(url)?.groupValues?.getOrNull(1)?.uppercase()
+    return when (client) {
+        "VISIONOS" -> "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)"
+        "ANDROID" -> "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
+        "ANDROID_VR" -> "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        "ANDROID_MUSIC" -> "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"
+        "IOS" -> "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+        else -> "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    }
+}
+
+/** The network underneath every player source: OkHttp behind the user's proxy, with client-matched User-Agent. */
 @UnstableApi
 private fun provideHttpDataSourceFactory(
     context: Context,
@@ -558,13 +596,12 @@ private fun provideHttpDataSourceFactory(
                 .Builder()
                 .connectTimeout(30.seconds)
                 .readTimeout(30.seconds)
-                .proxy(
+                .addInterceptor { chain ->
+                    val req = chain.request()
+                    val ua = userAgentForStreamUrl(req.url.toString())
+                    chain.proceed(req.newBuilder().header("User-Agent", ua).build())
+                }.proxy(
                     proxy,
-                ).addInterceptor(
-                    HttpLoggingInterceptor()
-                        .apply {
-                            level = HttpLoggingInterceptor.Level.HEADERS
-                        },
                 ).build(),
         ),
     )
@@ -574,12 +611,12 @@ private fun provideLoadControl(): LoadControl =
     DefaultLoadControl
         .Builder()
         .setBufferDurationsMs(
-            DEFAULT_MIN_BUFFER_MS * 4,
-            DEFAULT_MAX_BUFFER_MS * 4,
+            30_000,
+            60_000,
             // bufferForPlaybackMs=
             0,
             // bufferForPlaybackAfterRebufferMs=
-            0,
+            500,
         ).build()
 
 @UnstableApi

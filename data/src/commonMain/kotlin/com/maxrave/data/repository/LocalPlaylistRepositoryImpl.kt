@@ -809,7 +809,8 @@ internal class LocalPlaylistRepositoryImpl(
                                         values.getPlaylistContinuation()
                                     count++
                                 }.onFailure {
-                                    Logger.e("Continue", "Error: ${it.message}")
+                                    if (it is kotlinx.coroutines.CancellationException) throw it
+                                    Logger.e("Continue", "Error: ${it.message ?: it::class.simpleName}")
                                     continueParam = null
                                     count++
                                 }

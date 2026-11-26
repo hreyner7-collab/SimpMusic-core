@@ -70,13 +70,6 @@ class SpotifyClient {
                 }
             }
             install(HttpCache)
-            install(Logging) {
-                logger = Logger.DEFAULT
-                level = LogLevel.ALL
-            }
-            install(CurlLogger) {
-                logger = { Logger.DEFAULT.log(it) }
-            }
             install(HttpSend) {
                 maxSendCount = 100
             }
@@ -158,19 +151,17 @@ class SpotifyClient {
         sTime: String,
         cTime: String,
         totpVersion: Int,
+        productType: String = "web-player",
     ) = spotifyClient.get("https://open.spotify.com/api/token") {
         userAgent(USER_AGENT)
-        contentType(ContentType.Application.Json)
-        header(
-            "Cookie",
-            "sp_dc=$spdc",
-        )
+        header("Cookie", "sp_dc=$spdc")
         parameter("reason", reason)
-        parameter("productType", "mobile-web-player")
+        parameter("productType", productType)
         parameter("totp", otpValue)
         parameter("totpServer", otpValue)
         parameter("totpVer", totpVersion)
-        header("Cookie", "sp_dc=$spdc")
+        header("App-platform", "WebPlayer")
+        header("Spotify-App-Version", "1.2.61.20.g3b4cd5b2")
         header("Accept", "application/json")
         header("Origin", "https://open.spotify.com")
         header("Referer", "https://open.spotify.com/")
@@ -271,6 +262,121 @@ class SpotifyClient {
             )
         }
 
+    private suspend fun authorizedApiGet(
+        url: String,
+        authToken: String,
+        clientToken: String,
+    ) = spotifyClient.get(url) {
+        userAgent(USER_AGENT)
+        header("Authorization", "Bearer $authToken")
+        // Internal WebPlayer headers are only valid for browser sp_dc sessions that carry a
+        // Client-Token. Sending them alongside official OAuth PKCE Bearer tokens triggers 403s.
+        if (clientToken.isNotBlank()) {
+            header("Client-Token", clientToken)
+            header("App-platform", "WebPlayer")
+            header("Spotify-App-Version", "1.2.61.20.g3b4cd5b2")
+            header("Origin", "https://open.spotify.com")
+            header("Referer", "https://open.spotify.com/")
+        }
+        header(HttpHeaders.Accept, "application/json")
+        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+    }
+
+    suspend fun getUserPlaylists(
+        authToken: String,
+        clientToken: String,
+        limit: Int = 50,
+        offset: Int = 0,
+    ) = authorizedApiGet(
+        url = "https://api.spotify.com/v1/me/playlists?limit=$limit&offset=$offset",
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getSavedTracks(
+        authToken: String,
+        clientToken: String,
+        limit: Int = 50,
+        offset: Int = 0,
+    ) = authorizedApiGet(
+        url = "https://api.spotify.com/v1/me/tracks?limit=$limit&offset=$offset",
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getSavedAlbums(
+        authToken: String,
+        clientToken: String,
+        limit: Int = 50,
+        offset: Int = 0,
+    ) = authorizedApiGet(
+        url = "https://api.spotify.com/v1/me/albums?limit=$limit&offset=$offset",
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getPlaylistMeta(
+        playlistId: String,
+        authToken: String,
+        clientToken: String,
+    ) = authorizedApiGet(
+        // Omit `fields=tracks(total)` because Spotify's 2026 schema uses `items(total)`.
+        url = "https://api.spotify.com/v1/playlists/$playlistId",
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getPlaylistTracks(
+        playlistId: String,
+        authToken: String,
+        clientToken: String,
+        limit: Int = 100,
+        offset: Int = 0,
+    ): io.ktor.client.statement.HttpResponse {
+        val itemsResponse =
+            authorizedApiGet(
+                url = "https://api.spotify.com/v1/playlists/$playlistId/items?limit=$limit&offset=$offset",
+                authToken = authToken,
+                clientToken = clientToken,
+            )
+        if (itemsResponse.status.value == 400 || itemsResponse.status.value == 404) {
+            return authorizedApiGet(
+                url = "https://api.spotify.com/v1/playlists/$playlistId/tracks?limit=$limit&offset=$offset",
+                authToken = authToken,
+                clientToken = clientToken,
+            )
+        }
+        return itemsResponse
+    }
+
+    suspend fun getAlbumDetail(
+        albumId: String,
+        authToken: String,
+        clientToken: String,
+    ) = authorizedApiGet(
+        url = "https://api.spotify.com/v1/albums/$albumId",
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getApiUrl(
+        url: String,
+        authToken: String,
+        clientToken: String,
+    ) = authorizedApiGet(
+        url = url,
+        authToken = authToken,
+        clientToken = clientToken,
+    )
+
+    suspend fun getPublicEmbedHtml(
+        kind: String,
+        id: String,
+    ) = spotifyClient.get("https://open.spotify.com/embed/$kind/$id") {
+        userAgent(USER_AGENT)
+        header(HttpHeaders.Accept, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    }
+
     fun getRandomUserAgent(): String {
         val macOSVersion = "${Random.nextInt(11, 15)}_${Random.nextInt(4, 9)}"
         val webKitVersion = "${Random.nextInt(530, 537)}.${Random.nextInt(30, 37)}"
@@ -281,6 +387,6 @@ class SpotifyClient {
     }
 
     companion object {
-        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.157 Safari/537.36"
+        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
     }
 }

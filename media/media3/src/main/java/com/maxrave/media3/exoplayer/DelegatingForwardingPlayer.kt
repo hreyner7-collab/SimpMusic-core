@@ -117,10 +117,10 @@ internal class DelegatingForwardingPlayer(
     // ========== Listener Tracking ==========
 
     // Track all externally registered listeners so we can re-register them after delegate swap
-    private val trackedListeners = mutableListOf<Player.Listener>()
+    private val trackedListeners = java.util.concurrent.CopyOnWriteArrayList<Player.Listener>()
 
     override fun addListener(listener: Player.Listener) {
-        trackedListeners.add(listener)
+        trackedListeners.addIfAbsent(listener)
         super.addListener(listener)
     }
 

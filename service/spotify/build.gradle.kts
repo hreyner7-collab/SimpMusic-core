@@ -65,6 +65,7 @@ kotlin {
                 implementation(projects.common)
 
                 implementation(libs.logging)
+                implementation(libs.okio)
             }
         }
 

@@ -15,6 +15,7 @@ import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.models.YouTubeLocale
 import com.maxrave.logger.Logger
 import com.maxrave.spotify.Spotify
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -27,12 +28,14 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okio.IOException
 import okio.Path.Companion.toPath
 import okio.buffer
 import okio.use
 import org.simpmusic.aiservice.AIHost
 import org.simpmusic.aiservice.AiClient
+import kotlin.concurrent.Volatile
 import kotlin.time.Clock
 import kotlin.time.ExperimentalTime
 
@@ -44,12 +47,24 @@ internal class CommonRepositoryImpl(
     private val spotify: Spotify,
     private val aiClient: AiClient,
 ) : CommonRepository {
+    @Volatile
+    private var initStarted = false
+    private val cookieReady = CompletableDeferred<Unit>()
+
+    override suspend fun awaitCookieReady() {
+        if (!initStarted || cookieReady.isCompleted) return
+        withTimeoutOrNull(COOKIE_READY_TIMEOUT_MS) {
+            cookieReady.await()
+        }
+    }
+
     @OptIn(ExperimentalTime::class)
     override fun init(
         cookiePath: String,
         dataStoreManager: DataStoreManager,
         isDevBuild: Boolean,
     ) {
+        initStarted = true
         youTube.cookiePath = cookiePath.toPath()
         coroutineScope.launch {
             val resetSpotifyToken =
@@ -75,24 +90,6 @@ internal class CommonRepositoryImpl(
                             )
                     }
                 }
-            val ytCookieJob =
-                launch {
-                    dataStoreManager.cookie.distinctUntilChanged().collectLatest { cookie ->
-                        if (cookie.isNotEmpty()) {
-                            youTube.cookie = cookie
-                            youTube.visitorData()?.let {
-                                youTube.visitorData = it
-                            }
-                        } else {
-                            youTube.cookie = null
-                        }
-                        Logger.d("YouTube", "New cookie")
-                        localDataSource.getUsedGoogleAccount()?.netscapeCookie?.let {
-                            writeTextToFile(it, cookiePath)
-                            Logger.w("YouTube", "Wrote cookie to file")
-                        }
-                    }
-                }
             val pageIdJob =
                 launch {
                     dataStoreManager.pageId.distinctUntilChanged().collectLatest { pageId ->
@@ -109,6 +106,30 @@ internal class CommonRepositoryImpl(
                     dataStoreManager.authUser.distinctUntilChanged().collectLatest { authUser ->
                         youTube.authUser = authUser
                         Logger.d("YouTube", "New authUser")
+                    }
+                }
+            val ytCookieJob =
+                launch {
+                    dataStoreManager.cookie.distinctUntilChanged().collectLatest { cookie ->
+                        try {
+                            if (cookie.isNotEmpty()) {
+                                youTube.cookie = cookie
+                            } else {
+                                youTube.cookie = null
+                            }
+                        } finally {
+                            cookieReady.complete(Unit)
+                        }
+                        if (cookie.isNotEmpty()) {
+                            youTube.visitorData()?.let {
+                                youTube.visitorData = it
+                            }
+                        }
+                        Logger.d("YouTube", "New cookie")
+                        localDataSource.getUsedGoogleAccount()?.netscapeCookie?.let {
+                            writeTextToFile(it, cookiePath)
+                            Logger.w("YouTube", "Wrote cookie to file")
+                        }
                     }
                 }
             val usingProxy =
@@ -209,7 +230,8 @@ internal class CommonRepositoryImpl(
                                 config.promos?.toString() ?: "[]",
                             )
                         }.onFailure {
-                            Logger.e("RemoteConfig", "TIDAL remote config fetch failed: ${it.message}")
+                            if (it is kotlinx.coroutines.CancellationException) throw it
+                            Logger.w("RemoteConfig", "TIDAL remote config fetch skipped: ${it.message}")
                         }
                 }
             val aiClientProviderJob =
@@ -294,6 +316,8 @@ internal class CommonRepositoryImpl(
             aiCustomModelIdJob.join()
             aiCustomBaseUrlJob.join()
             aiCustomHeadersJob.join()
+        }.invokeOnCompletion {
+            cookieReady.complete(Unit)
         }
     }
 
@@ -399,6 +423,7 @@ expect fun clearProxyAuthenticator()
 
 /** Newest artwork per Your library card; the card draws as many of these as its fan has slots. */
 private const val LIBRARY_ARTWORK = 3
+private const val COOKIE_READY_TIMEOUT_MS = 5_000L
 
 expect fun getCookies(
     url: String,

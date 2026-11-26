@@ -45,7 +45,9 @@ data class YouTubeClient(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
         private const val USER_AGENT_ANDROID =
             "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"
-        private const val USER_AGENT_IOS = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
+        private const val USER_AGENT_IOS = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+        private const val USER_AGENT_ANDROID_VR =
+            "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         private const val USER_AGENT_MWEB =
             "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)"
 
@@ -117,19 +119,50 @@ data class YouTubeClient(
                 userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
             )
 
+        val ANDROID_VR =
+            YouTubeClient(
+                clientName = "ANDROID_VR",
+                clientVersion = "1.62.27",
+                api_key = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+                userAgent = USER_AGENT_ANDROID_VR,
+                deviceMake = "Oculus",
+                deviceModel = "Quest 3",
+                osName = "Android",
+                osVersion = "12L",
+                xClientName = 28,
+            )
+
         val IOS =
             YouTubeClient(
                 clientName = "IOS",
-                clientVersion = "19.45.4",
+                clientVersion = "20.10.4",
                 deviceMake = "Apple",
                 deviceModel = "iPhone16,2",
                 userAgent = USER_AGENT_IOS,
                 api_key = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
                 osName = "iPhone",
-                osVersion = "17.5.1.21F90",
+                osVersion = "18.3.2.22D82",
                 timeZone = "UTC",
                 utcOffsetMinutes = 0,
                 xClientName = 5,
+            )
+
+        const val USER_AGENT_VISIONOS =
+            "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)"
+
+        val VISIONOS =
+            YouTubeClient(
+                clientName = "VISIONOS",
+                clientVersion = "1.04",
+                deviceMake = "Apple",
+                deviceModel = "RealityDevice17,1",
+                userAgent = USER_AGENT_VISIONOS,
+                api_key = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
+                osName = "visionOS",
+                osVersion = "26.6.0.23O770",
+                timeZone = "UTC",
+                utcOffsetMinutes = 0,
+                xClientName = 101,
             )
 
         val MWEB =

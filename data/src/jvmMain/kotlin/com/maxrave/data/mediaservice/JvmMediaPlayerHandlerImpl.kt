@@ -30,6 +30,7 @@ import com.maxrave.domain.data.model.searchResult.songs.Artist
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint
 import com.maxrave.domain.data.player.AppOnScreen
 import com.maxrave.domain.data.player.AudioEffects
+import com.maxrave.domain.data.player.StereoWidener
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.EightDDirection
 import com.maxrave.domain.data.player.EightDEffect
@@ -70,15 +71,19 @@ import com.maxrave.domain.repository.SongRepository
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.domain.utils.FilterState
 import com.maxrave.domain.utils.MusicVideoType
+import com.maxrave.domain.utils.PlaybackBlocklistState
 import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.connectArtists
 import com.maxrave.domain.utils.isEndlessQueueId
+import com.maxrave.domain.utils.playbackBlocklistFlow
+import com.maxrave.domain.utils.smartArtistSpacedShuffle
 import com.maxrave.domain.utils.toArrayListTrack
 import com.maxrave.domain.utils.toListName
 import com.maxrave.domain.utils.toSongEntity
 import com.maxrave.domain.utils.toTrack
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -144,6 +149,8 @@ class JvmMediaPlayerHandlerImpl(
     private val analyticsRepository: AnalyticsRepository,
     private val discordRepository: DiscordRepository,
     private val coroutineScope: CoroutineScope,
+    playerOverride: MediaPlayerInterface? = null,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main,
 ) : MediaPlayerHandler,
     MediaPlayerListener {
     private val backgroundScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -207,7 +214,7 @@ class JvmMediaPlayerHandlerImpl(
     // init from taking down the whole handler — every nypc call site is already
     // null-safe, so a null here simply disables system media controls.
     private val nypc =
-        if (getPlatform() is Platform.Linux || getPlatform() is Platform.Windows) {
+        if (playerOverride == null && (getPlatform() is Platform.Linux || getPlatform() is Platform.Windows)) {
             runCatching { NPYC(getPlatform()) }.getOrNull()
         } else {
             null
@@ -238,7 +245,7 @@ class JvmMediaPlayerHandlerImpl(
         }
     }
 
-    override val player: MediaPlayerInterface = getKoin().get()
+    override val player: MediaPlayerInterface = playerOverride ?: getKoin().get()
 
     @Volatile
     private var discordRPC: RichPresenceClient? = null
@@ -337,6 +344,18 @@ class JvmMediaPlayerHandlerImpl(
 
     private var sleepTimerJob: Job? = null
 
+    @Volatile
+    private var sleepSongsRemaining: Int = 0
+
+    @Volatile
+    private var lastTransitionMediaId: String? = null
+
+    @Volatile
+    private var currentBlocklist: PlaybackBlocklistState = PlaybackBlocklistState()
+
+    @Volatile
+    private var blockedSkipStreak: Int = 0
+
     /** How long the sleep timer spends ramping the volume down before it stops playback. */
     private val sleepFadeDurationMs = 5_000L
 
@@ -366,7 +385,24 @@ class JvmMediaPlayerHandlerImpl(
     private var toggleLikeJob: Job? = null
 
     private var loadJob: Job? = null
+    private var getRelatedJob: Job? = null
+    private var loadMoreJob: Job? = null
+    private var toggleRadioJob: Job? = null
+    private val loadMediaItemGeneration = AtomicLong(0L)
     private val restoreQueueMutex = Mutex()
+
+    private fun cancelQueueLoadingJobs(cancelToggleRadio: Boolean = true) {
+        loadJob?.cancel()
+        loadJob = null
+        getRelatedJob?.cancel()
+        getRelatedJob = null
+        loadMoreJob?.cancel()
+        loadMoreJob = null
+        if (cancelToggleRadio) {
+            toggleRadioJob?.cancel()
+            toggleRadioJob = null
+        }
+    }
 
     private var songEntityJob: Job? = null
 
@@ -430,6 +466,11 @@ class JvmMediaPlayerHandlerImpl(
         getFormatJob = Job()
         jobWatchtime = Job()
         skipSilent = runBlocking { dataStoreManager.skipSilent.first() == TRUE }
+        backgroundScope.launch {
+            dataStoreManager.playbackBlocklistFlow().collectLatest { state ->
+                currentBlocklist = state
+            }
+        }
         // Collected rather than read once like the settings around it: the equalizer is adjusted
         // while music is playing, and a curve that only takes effect after a restart is useless
         // for judging what you just changed.
@@ -483,7 +524,13 @@ class JvmMediaPlayerHandlerImpl(
                         null
                     }
                 }
-            combine(delayEffects, reverbEffects) { echo, room -> AudioEffects(delay = echo, reverb = room) }
+            val widenEffect =
+                combine(dataStoreManager.stereoWidenEnabled, dataStoreManager.stereoWidenAmount) { enabled, amount ->
+                    if (enabled == TRUE) StereoWidener.widthFor(amount) else null
+                }
+            combine(delayEffects, reverbEffects, widenEffect) { echo, room, width ->
+                AudioEffects(delay = echo, reverb = room, stereoWidth = width)
+            }
                 .distinctUntilChanged()
                 .collect { effects -> player.setAudioEffects(effects) }
         }
@@ -598,6 +645,9 @@ class JvmMediaPlayerHandlerImpl(
                             if (categories != null && player.duration > 0L && skipSegments != null) {
                                 for (skip in skipSegments) {
                                     if (categories.contains(skip.category)) {
+                                        if (skip.segment.size < 2 || skip.videoDuration <= 0.0) {
+                                            continue
+                                        }
                                         if (skip.segment[1] - skip.segment[0] < SPONSOR_BLOCK_MIN_SEGMENT_SECONDS) {
                                             continue
                                         }
@@ -608,7 +658,8 @@ class JvmMediaPlayerHandlerImpl(
                                             Logger.w(TAG, "Seek to $secondPart")
                                             Logger.d(TAG, "Seek to Cr: $current, First: $firstPart, Second: $secondPart")
                                             skipSegment(
-                                                (secondPart * player.duration).toLong() / 100 + SPONSOR_BLOCK_SKIP_MARGIN_MS,
+                                                ((secondPart * player.duration).toLong() / 100 + SPONSOR_BLOCK_SKIP_MARGIN_MS)
+                                                    .coerceIn(0L, player.duration),
                                             )
                                             showToast(ToastType.SponsorBlockSkip(skip.category))
                                         }
@@ -641,13 +692,13 @@ class JvmMediaPlayerHandlerImpl(
                     combine(dataStoreManager.playbackSpeed, dataStoreManager.pitch) { speed, pitch ->
                         Pair(speed, pitch)
                     }.distinctUntilChanged().collectLatest { pair ->
-                        Logger.w(TAG, "Playback speed: ${pair.first}, Pitch: ${pair.second}")
+                        Logger.d(TAG, "Playback speed: ${pair.first}, Pitch: ${pair.second}")
                         player.playbackParameters =
                             GenericPlaybackParameters(
                                 pair.first,
                                 2f.pow(pair.second.toFloat() / 12),
                             )
-                        Logger.w(TAG, "Playback current speed: ${player.playbackParameters.speed}, Pitch: ${player.playbackParameters.pitch}")
+                        Logger.d(TAG, "Playback current speed: ${player.playbackParameters.speed}, Pitch: ${player.playbackParameters.pitch}")
                         // A speed change shifts the RPC start/end timestamps (Discord renders the bar
                         // from timestamps client-side), so refresh presence while actively playing.
                         if (player.isPlaying) {
@@ -1014,10 +1065,6 @@ class JvmMediaPlayerHandlerImpl(
         index?.let {
             player.addMediaItem(it, mediaItem)
         } ?: player.addMediaItem(mediaItem)
-        if (player.mediaItemCount == 1) {
-            player.prepare()
-            player.playWhenReady = true
-        }
         updateNextPreviousTrackAvailability()
     }
 
@@ -1210,21 +1257,22 @@ class JvmMediaPlayerHandlerImpl(
             }
 
             is PlayerEvent.UpdateProgress -> {
-                resetPositionSmoothing()
-                player.seekTo((player.duration * playerEvent.newProgress / 100).toLong())
-                if (player.isPlaying) {
-                    nowPlayingState.value.songEntity?.let { updateDiscordRpc(it) }
+                val duration = player.duration
+                if (duration > 0L && playerEvent.newProgress.isFinite()) {
+                    resetPositionSmoothing()
+                    val targetMs =
+                        ((duration.toDouble() * playerEvent.newProgress.coerceIn(0f, 100f)) / 100.0)
+                            .toLong()
+                            .coerceIn(0L, duration)
+                    player.seekTo(targetMs)
+                    if (player.isPlaying) {
+                        nowPlayingState.value.songEntity?.let { updateDiscordRpc(it) }
+                    }
                 }
             }
 
             PlayerEvent.Shuffle -> {
-                if (player.shuffleModeEnabled) {
-                    player.shuffleModeEnabled = false
-                    _controlState.value = _controlState.value.copy(isShuffle = false)
-                } else {
-                    player.shuffleModeEnabled = true
-                    _controlState.value = _controlState.value.copy(isShuffle = true)
-                }
+                setShuffle(!player.shuffleModeEnabled)
             }
 
             PlayerEvent.Repeat -> {
@@ -1271,44 +1319,61 @@ class JvmMediaPlayerHandlerImpl(
         }
     }
 
-    override fun toggleRadio() {
-        coroutineScope.launch {
-            val currentSong = nowPlayingState.value.songEntity ?: return@launch
-            Logger.d(TAG, "toggleRadio: ${currentSong.title}")
-            songRepository
-                .getRadioFromEndpoint(
-                    YouTubeWatchEndpoint(
-                        videoId = currentSong.videoId,
-                        playlistId = "RDAMVM${currentSong.videoId}",
-                    ),
-                ).collectLatest { res ->
-                    val data = res.data
-                    when (res) {
-                        is Resource.Success if (data != null && data.first.isNotEmpty()) -> {
-                            setQueueData(
-                                QueueData.Data(
-                                    listTracks = data.first,
-                                    firstPlayedTrack = data.first.first(),
-                                    playlistId = "RDAMVM${currentSong.videoId}",
-                                    playlistName = "\"${currentSong.title}\" Radio",
-                                    playlistType = PlaylistType.RADIO,
-                                    continuation = data.second,
-                                ),
-                            )
-                            clearMediaItems()
-                            currentSong.durationSeconds.let {
-                                songRepository.updateDurationSeconds(it, currentSong.videoId)
-                            }
-                            addMediaItem(currentSong.toGenericMediaItem(), playWhenReady = true)
-                            loadPlaylistOrAlbum(0)
-                        }
+    override fun setShuffle(enabled: Boolean) {
+        if (player.shuffleModeEnabled != enabled) {
+            player.shuffleModeEnabled = enabled
+        }
+        if (_controlState.value.isShuffle != enabled) {
+            _controlState.value = _controlState.value.copy(isShuffle = enabled)
+        }
+        backgroundScope.launch {
+            if (dataStoreManager.saveStateOfPlayback.first() == TRUE) {
+                dataStoreManager.recoverShuffleAndRepeatKey(enabled, player.repeatMode)
+            }
+        }
+    }
 
-                        else -> {
-                            Logger.e(TAG, "toggleRadio: ${res.message}")
+    override fun toggleRadio() {
+        loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs(cancelToggleRadio = true)
+        toggleRadioJob =
+            coroutineScope.launch {
+                val currentSong = nowPlayingState.value.songEntity ?: return@launch
+                Logger.d(TAG, "toggleRadio: ${currentSong.title}")
+                songRepository
+                    .getRadioFromEndpoint(
+                        YouTubeWatchEndpoint(
+                            videoId = currentSong.videoId,
+                            playlistId = "RDAMVM${currentSong.videoId}",
+                        ),
+                    ).collectLatest { res ->
+                        val data = res.data
+                        when (res) {
+                            is Resource.Success if (data != null && data.first.isNotEmpty()) -> {
+                                setQueueData(
+                                    QueueData.Data(
+                                        listTracks = data.first,
+                                        firstPlayedTrack = data.first.first(),
+                                        playlistId = "RDAMVM${currentSong.videoId}",
+                                        playlistName = "\"${currentSong.title}\" Radio",
+                                        playlistType = PlaylistType.RADIO,
+                                        continuation = data.second,
+                                    ),
+                                )
+                                clearMediaItemsInternal(cancelToggleRadio = false)
+                                currentSong.durationSeconds.let {
+                                    songRepository.updateDurationSeconds(it, currentSong.videoId)
+                                }
+                                addMediaItem(currentSong.toGenericMediaItem(), playWhenReady = true)
+                                loadPlaylistOrAlbum(0)
+                            }
+
+                            else -> {
+                                Logger.e(TAG, "toggleRadio: ${res.message}")
+                            }
                         }
                     }
-                }
-        }
+            }
     }
 
     override fun toggleLike() {
@@ -1324,7 +1389,7 @@ class JvmMediaPlayerHandlerImpl(
                     id,
                     if (!(controlState.first().isLiked)) 1 else 0,
                 )
-                delay(200)
+                // removed artificial 200ms catalog delay
             }
     }
 
@@ -1333,20 +1398,35 @@ class JvmMediaPlayerHandlerImpl(
     }
 
     override fun resetSongAndQueue() {
+        loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs()
         player.clearMediaItems()
         _queueData.value = QueueData()
     }
 
     override fun sleepStart(minutes: Int) {
+        if (minutes <= 0) {
+            sleepStop()
+            return
+        }
+        if (minutes == Int.MAX_VALUE - 3) {
+            sleepAfterSongs(3)
+            return
+        }
+        if (minutes == Int.MAX_VALUE - 5) {
+            sleepAfterSongs(5)
+            return
+        }
+        sleepSongsRemaining = if (minutes == Int.MAX_VALUE) 1 else 0
         sleepTimerJob?.cancel()
         sleepTimerJob =
-            coroutineScope.launch(Dispatchers.Main) {
+            coroutineScope.launch(mainDispatcher) {
                 var stoppedPlayback = false
                 try {
                     if (minutes == Int.MAX_VALUE) {
                         // "End of current song" mode: use sentinel -1 to indicate this special state
                         _sleepTimerState.update {
-                            it.copy(isDone = false, timeRemaining = -1)
+                            it.copy(isDone = false, timeRemaining = -1, songsRemaining = 1)
                         }
                         // Poll until player duration is available (may be -1 initially)
                         var duration = player.duration
@@ -1355,11 +1435,6 @@ class JvmMediaPlayerHandlerImpl(
                             duration = player.duration
                         }
                         val remaining = (duration - player.currentPosition).coerceAtLeast(0L)
-                        // Fade over the tail of the track rather than after it, so the song is
-                        // already silent by the time it ends. A track with less time left than the
-                        // fade gets a shorter one instead of bleeding into whatever plays next.
-                        // Fade and tail together must fit inside what is left, or the timer would
-                        // run past the end of the track and pause somewhere inside the next one.
                         val fadeMs = sleepFadeDurationMs.coerceAtMost(remaining)
                         val tailMs = sleepFadeTailMs.coerceAtMost(remaining - fadeMs)
                         delay(remaining - fadeMs - tailMs)
@@ -1367,16 +1442,16 @@ class JvmMediaPlayerHandlerImpl(
                         delay(tailMs)
                         player.pause()
                         stoppedPlayback = true
+                        sleepSongsRemaining = 0
                         _sleepTimerState.update {
-                            it.copy(isDone = true, timeRemaining = 0)
+                            it.copy(isDone = true, timeRemaining = 0, songsRemaining = 0)
                         }
                     } else {
                         _sleepTimerState.update {
-                            it.copy(isDone = false, timeRemaining = minutes)
+                            it.copy(isDone = false, timeRemaining = minutes, songsRemaining = 0)
                         }
                         var count = minutes
                         while (count > 0) {
-                            // The fade belongs inside the final minute, so shorten that wait by its length.
                             val isFinalMinute = count == 1
                             delay(
                                 if (isFinalMinute) 60 * 1000L - sleepFadeDurationMs - sleepFadeTailMs else 60 * 1000L,
@@ -1387,24 +1462,34 @@ class JvmMediaPlayerHandlerImpl(
                             }
                             count--
                             _sleepTimerState.update {
-                                it.copy(isDone = false, timeRemaining = count)
+                                it.copy(isDone = false, timeRemaining = count, songsRemaining = 0)
                             }
                         }
                         player.pause()
                         stoppedPlayback = true
                         _sleepTimerState.update {
-                            it.copy(isDone = true, timeRemaining = 0)
+                            it.copy(isDone = true, timeRemaining = 0, songsRemaining = 0)
                         }
                     }
                 } finally {
-                    // Only the cancelled path clears the attenuation here — sleepStop(), or the
-                    // scope going away mid-fade. When the timer runs to completion the adapter
-                    // clears it instead, from inside the pause it queued, because pause() is
-                    // asynchronous and this coroutine cannot tell when playback actually stopped.
-                    // Restoring it from here would lift the volume back over the last of the audio.
                     if (!stoppedPlayback) player.sleepFadeFactor = 1f
                 }
             }
+    }
+
+    override fun sleepAfterSongs(songCount: Int) {
+        if (songCount <= 0) {
+            sleepStop()
+            return
+        }
+        if (songCount == 1) {
+            sleepStart(Int.MAX_VALUE)
+            return
+        }
+        sleepTimerJob?.cancel()
+        player.sleepFadeFactor = 1f
+        sleepSongsRemaining = songCount
+        _sleepTimerState.value = SleepTimerState(isDone = false, timeRemaining = -1, songsRemaining = songCount)
     }
 
     /**
@@ -1430,7 +1515,8 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun sleepStop() {
         sleepTimerJob?.cancel()
-        _sleepTimerState.value = SleepTimerState(false, 0)
+        sleepSongsRemaining = 0
+        _sleepTimerState.value = SleepTimerState(false, 0, 0)
     }
 
     override fun removeMediaItem(position: Int) {
@@ -1459,13 +1545,21 @@ class JvmMediaPlayerHandlerImpl(
         mediaItem: GenericMediaItem,
         playWhenReady: Boolean,
     ) {
-        player.clearMediaItems()
-        player.setMediaItem(mediaItem)
-        player.prepare()
-        player.playWhenReady = playWhenReady
+        player.setMediaItem(mediaItem, playWhenReady)
     }
 
     override fun clearMediaItems() {
+        clearMediaItemsInternal(cancelToggleRadio = true)
+    }
+
+    private fun clearMediaItemsInternal(cancelToggleRadio: Boolean) {
+        loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs(cancelToggleRadio = cancelToggleRadio)
+        _queueData.update {
+            it.copy(
+                queueState = QueueData.StateSource.STATE_CREATED,
+            )
+        }
         player.clearMediaItems()
     }
 
@@ -1487,7 +1581,7 @@ class JvmMediaPlayerHandlerImpl(
     override fun currentOrderIndex(): Int =
         if (player.shuffleModeEnabled) {
             queueData.value.data.listTracks.indexOfLast {
-                it.videoId == player.currentMediaItem?.mediaId
+                it.videoId == player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO)
             }
         } else {
             currentSongIndex()
@@ -1519,6 +1613,9 @@ class JvmMediaPlayerHandlerImpl(
     override fun shufflePlaylist(randomTrackIndex: Int) {
         val playlistId = _queueData.value.data.playlistId ?: return
         val firstPlayedTrack = _queueData.value.data.firstPlayedTrack ?: return
+        loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs()
+        setShuffle(true)
         coroutineScope.launch {
             if (playlistId.startsWith(LOCAL_PLAYLIST_ID)) {
                 songRepository.insertSong(firstPlayedTrack.toSongEntity()).collect {
@@ -1529,16 +1626,25 @@ class JvmMediaPlayerHandlerImpl(
                     songRepository.updateDurationSeconds(it, firstPlayedTrack.videoId)
                 }
                 addMediaItem(firstPlayedTrack.toGenericMediaItem(), playWhenReady = true)
-                val longId = playlistId.replace(LOCAL_PLAYLIST_ID, "").toLong()
+                val longId = playlistId.replace(LOCAL_PLAYLIST_ID, "").toLongOrNull() ?: return@launch
                 val localPlaylist = localPlaylistRepository.getLocalPlaylist(longId).lastOrNull()?.data
                 if (localPlaylist != null) {
                     Logger.w(TAG, "shufflePlaylist: Local playlist track size ${localPlaylist.tracks?.size}")
-                    val trackCount = localPlaylist.tracks?.size ?: return@launch
+                    val trackCount = localPlaylist.tracks?.size ?: 0
                     val listPosition =
                         (0 until trackCount).toMutableList().apply {
                             remove(randomTrackIndex)
                         }
-                    if (listPosition.isEmpty()) return@launch
+                    if (listPosition.isEmpty()) {
+                        _queueData.update {
+                            it.copy(
+                                queueState = QueueData.StateSource.STATE_INITIALIZED,
+                                data = it.data.copy(continuation = null),
+                            )
+                        }
+                        updateNextPreviousTrackAvailability()
+                        return@launch
+                    }
                     listPosition.shuffle()
                     _queueData.update {
                         it.copy(
@@ -1550,6 +1656,14 @@ class JvmMediaPlayerHandlerImpl(
                         )
                     }
                     loadMore()
+                } else {
+                    _queueData.update {
+                        it.copy(
+                            queueState = QueueData.StateSource.STATE_INITIALIZED,
+                            data = it.data.copy(continuation = null),
+                        )
+                    }
+                    updateNextPreviousTrackAvailability()
                 }
             }
         }
@@ -1566,20 +1680,23 @@ class JvmMediaPlayerHandlerImpl(
         Logger.w("Check loadMore", continuation.toString())
         if (continuation != null) {
             if (playlistId.startsWith(LOCAL_PLAYLIST_ID)) {
-                coroutineScope.launch {
-                    _queueData.update {
-                        it.copy(
-                            queueState = QueueData.StateSource.STATE_INITIALIZING,
-                        )
-                    }
-                    val longId =
+                loadMoreJob?.cancel()
+                loadMoreJob =
+                    coroutineScope.launch {
                         try {
-                            playlistId.replace(LOCAL_PLAYLIST_ID, "").toLong()
-                        } catch (e: NumberFormatException) {
-                            return@launch
-                        }
-                    Logger.w("Check loadMore", longId.toString())
-                    if (continuation.startsWith("SHUFFLE")) {
+                            _queueData.update {
+                                it.copy(
+                                    queueState = QueueData.StateSource.STATE_INITIALIZING,
+                                )
+                            }
+                            val longId =
+                                try {
+                                    playlistId.replace(LOCAL_PLAYLIST_ID, "").toLong()
+                                } catch (e: NumberFormatException) {
+                                    return@launch
+                                }
+                            Logger.w("Check loadMore", longId.toString())
+                            if (continuation.startsWith("SHUFFLE")) {
                         val regex = Regex("(?<=SHUFFLE)\\d+(?=_)")
                         var offset = regex.find(continuation)?.value?.toInt() ?: return@launch
                         val posString = continuation.removePrefix("SHUFFLE${offset}_")
@@ -1594,8 +1711,15 @@ class JvmMediaPlayerHandlerImpl(
                                 Logger.w("Check loadMore response", pair.size.toString())
                                 songRepository.getSongsByListVideoId(pair.map { it.songId }).lastOrNull()?.let { songs ->
                                     if (songs.isNotEmpty()) {
-                                        delay(300)
-                                        loadMoreCatalog(songs.toArrayListTrack())
+                                        val anchorArtist = queueData.value.data.listTracks.lastOrNull()?.artists?.firstOrNull()?.name
+                                        val spacedAllowed =
+                                            smartArtistSpacedShuffle(
+                                                currentBlocklist.filterAllowed(songs.toArrayListTrack()),
+                                                anchorArtist = anchorArtist,
+                                            ).toCollection(arrayListOf())
+                                        if (spacedAllowed.isNotEmpty()) {
+                                            loadMoreCatalog(spacedAllowed)
+                                        }
                                         offset++
                                         _queueData.update {
                                             it.copy(
@@ -1656,39 +1780,37 @@ class JvmMediaPlayerHandlerImpl(
                                     ).lastOrNull()
                                     ?.let { pair ->
                                         Logger.w("Check loadMore response", pair.size.toString())
-                                        songRepository.getSongsByListVideoId(pair.map { it.songId }).single().let { songs ->
-                                            if (songs.isNotEmpty()) {
-                                                delay(300)
-                                                loadMoreCatalog(songs.toArrayListTrack())
-                                                _queueData.update {
-                                                    it.copy(
-                                                        data =
-                                                            it.data.copy(
-                                                                continuation =
-                                                                    if (filter ==
-                                                                        FilterState.OlderFirst
-                                                                    ) {
-                                                                        ASC +
-                                                                            pair.lastOrNull()?.inPlaylist?.let { inPlaylist ->
-                                                                                converters.dateToTimestamp(inPlaylist)
-                                                                            }
-                                                                    } else {
-                                                                        DESC +
-                                                                            pair.lastOrNull()?.inPlaylist?.let { inPlaylist ->
-                                                                                converters.dateToTimestamp(inPlaylist)
-                                                                            }
-                                                                    },
-                                                            ),
-                                                    )
-                                                }
+                                        val songs =
+                                            if (pair.isNotEmpty()) {
+                                                songRepository.getSongsByListVideoId(pair.map { it.songId }).lastOrNull().orEmpty()
                                             } else {
-                                                _queueData.update {
-                                                    it.copy(
-                                                        queueState = QueueData.StateSource.STATE_INITIALIZED,
-                                                    )
-                                                }
-                                                reorderShuffledQueue(player.getCurrentMediaTimeLine())
+                                                emptyList()
                                             }
+                                        if (songs.isNotEmpty()) {
+                                            loadMoreCatalog(songs.toArrayListTrack())
+                                            val nextTs =
+                                                pair.lastOrNull()?.inPlaylist?.let { inPlaylist ->
+                                                    converters.dateToTimestamp(inPlaylist)
+                                                }
+                                            _queueData.update {
+                                                it.copy(
+                                                    data =
+                                                        it.data.copy(
+                                                            continuation =
+                                                                nextTs?.let {
+                                                                    (if (filter == FilterState.OlderFirst) ASC else DESC) + it
+                                                                },
+                                                        ),
+                                                )
+                                            }
+                                        } else {
+                                            _queueData.update {
+                                                it.copy(
+                                                    queueState = QueueData.StateSource.STATE_INITIALIZED,
+                                                    data = it.data.copy(continuation = null),
+                                                )
+                                            }
+                                            reorderShuffledQueue(player.getCurrentMediaTimeLine())
                                         }
                                     }
                             }
@@ -1696,9 +1818,9 @@ class JvmMediaPlayerHandlerImpl(
                             FilterState.Title, FilterState.CustomOrder -> {
                                 val offset =
                                     if (filter == FilterState.CustomOrder) {
-                                        continuation.removePrefix(CUSTOM_ORDER).toInt()
+                                        continuation.removePrefix(CUSTOM_ORDER).toIntOrNull() ?: return@launch
                                     } else {
-                                        continuation.removePrefix(TITLE).toInt()
+                                        continuation.removePrefix(TITLE).toIntOrNull() ?: return@launch
                                     }
                                 localPlaylistRepository
                                     .getPlaylistPairSongByOffset(
@@ -1708,55 +1830,70 @@ class JvmMediaPlayerHandlerImpl(
                                     ).lastOrNull()
                                     ?.let { pair ->
                                         Logger.w("Check loadMore response", pair.size.toString())
-                                        songRepository.getSongsByListVideoId(pair.map { it.songId }).single().let { songs ->
-                                            if (songs.isNotEmpty()) {
-                                                delay(300)
-                                                loadMoreCatalog(songs.toArrayListTrack())
-                                                _queueData.update {
-                                                    it.copy(
-                                                        data =
-                                                            it.data.copy(
-                                                                continuation =
-                                                                    if (filter ==
-                                                                        FilterState.CustomOrder
-                                                                    ) {
-                                                                        CUSTOM_ORDER + (offset + 1)
-                                                                    } else {
-                                                                        TITLE + (offset + 1).toString()
-                                                                    },
-                                                            ),
-                                                    )
-                                                }
+                                        val songs =
+                                            if (pair.isNotEmpty()) {
+                                                songRepository.getSongsByListVideoId(pair.map { it.songId }).lastOrNull().orEmpty()
                                             } else {
-                                                _queueData.update {
-                                                    it.copy(
-                                                        queueState = QueueData.StateSource.STATE_INITIALIZED,
-                                                    )
-                                                }
-                                                reorderShuffledQueue(player.getCurrentMediaTimeLine())
+                                                emptyList()
                                             }
+                                        if (songs.isNotEmpty()) {
+                                            loadMoreCatalog(songs.toArrayListTrack())
+                                            _queueData.update {
+                                                it.copy(
+                                                    data =
+                                                        it.data.copy(
+                                                            continuation =
+                                                                if (filter == FilterState.CustomOrder) {
+                                                                    CUSTOM_ORDER + (offset + 1)
+                                                                } else {
+                                                                    TITLE + (offset + 1).toString()
+                                                                },
+                                                        ),
+                                                )
+                                            }
+                                        } else {
+                                            _queueData.update {
+                                                it.copy(
+                                                    queueState = QueueData.StateSource.STATE_INITIALIZED,
+                                                    data = it.data.copy(continuation = null),
+                                                )
+                                            }
+                                            reorderShuffledQueue(player.getCurrentMediaTimeLine())
                                         }
                                     }
                             }
                         }
+                            }
+                        } finally {
+                            if (_queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) {
+                                _queueData.update {
+                                    it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
+                                }
+                            }
+                        }
                     }
-                }
             } else {
-                coroutineScope.launch {
-                    _queueData.update {
-                        it.copy(
-                            queueState = QueueData.StateSource.STATE_INITIALIZING,
-                        )
-                    }
-                    Logger.w(TAG, "Check loadMore continuation $continuation")
+                loadMoreJob?.cancel()
+                loadMoreJob =
+                    coroutineScope.launch {
+                        try {
+                            _queueData.update {
+                                it.copy(
+                                    queueState = QueueData.StateSource.STATE_INITIALIZING,
+                                )
+                            }
+                            Logger.w(TAG, "Check loadMore continuation $continuation")
                     songRepository
                         .getContinueTrack(playlistId, continuation)
                         .lastOrNull()
                         .let { response ->
                             val list = response?.first
                             if (list != null) {
-                                Logger.d(TAG, "Check loadMore response: ${list.size} tracks")
-                                loadMoreCatalog(list)
+                                val filtered = currentBlocklist.filterAllowed(list).toCollection(arrayListOf())
+                                Logger.d(TAG, "Check loadMore response: ${filtered.size}/${list.size} tracks")
+                                if (filtered.isNotEmpty()) {
+                                    loadMoreCatalog(filtered)
+                                }
                                 _queueData.update {
                                     it.copy(
                                         data =
@@ -1802,7 +1939,14 @@ class JvmMediaPlayerHandlerImpl(
                                 }
                             }
                         }
-                }
+                        } finally {
+                            if (_queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) {
+                                _queueData.update {
+                                    it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
+                                }
+                            }
+                        }
+                    }
             }
         } else if (runBlocking { dataStoreManager.endlessQueue.first() } == TRUE) {
             Logger.w(TAG, "loadMore: Endless Queue")
@@ -1831,43 +1975,58 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun getRelated(videoId: String) {
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
-        coroutineScope.launch {
-            songRepository.getRelatedData(videoId).collect { response ->
-                when (response) {
-                    is Resource.Success -> {
-                        loadMoreCatalog(response.data?.first?.toCollection(arrayListOf()) ?: arrayListOf())
-                        _queueData.update {
-                            it.copy(
-                                data =
-                                    it.data.copy(
-                                        continuation = response.data?.second,
-                                    ),
-                            )
+        loadJob?.cancel()
+        loadJob = null
+        getRelatedJob?.cancel()
+        loadMoreJob?.cancel()
+        loadMoreJob = null
+        getRelatedJob =
+            coroutineScope.launch {
+                songRepository.getRelatedData(videoId).collect { response ->
+                    when (response) {
+                        is Resource.Success -> {
+                            val existingIds = queueData.value.data.listTracks.mapTo(HashSet()) { it.videoId }
+                            existingIds.add(videoId)
+                            val filtered = response.data?.first
+                                ?.filter { it.videoId !in existingIds && !currentBlocklist.isTrackBlocked(it) }
+                                ?.distinctBy { it.videoId }
+                                ?.toCollection(arrayListOf())
+                                ?: arrayListOf()
+                            loadMoreCatalog(filtered)
+                            _queueData.update {
+                                it.copy(
+                                    data =
+                                        it.data.copy(
+                                            continuation = response.data?.second,
+                                        ),
+                                )
+                            }
                         }
-                    }
 
-                    is Resource.Error -> {
-                        Logger.d("Check Related", "getRelated: ${response.message}")
-                        _queueData.update {
-                            it.copy(
-                                queueState = QueueData.StateSource.STATE_INITIALIZED,
-                                data =
-                                    it.data.copy(
-                                        continuation = null,
-                                    ),
-                            )
+                        is Resource.Error -> {
+                            Logger.d("Check Related", "getRelated: ${response.message}")
+                            _queueData.update {
+                                it.copy(
+                                    queueState = QueueData.StateSource.STATE_INITIALIZED,
+                                    data =
+                                        it.data.copy(
+                                            continuation = null,
+                                        ),
+                                )
+                            }
+                            reorderShuffledQueue(player.getCurrentMediaTimeLine())
                         }
-                        reorderShuffledQueue(player.getCurrentMediaTimeLine())
                     }
                 }
             }
-        }
     }
 
     override fun setQueueData(queueData: QueueData.Data) {
+        cancelQueueLoadingJobs(cancelToggleRadio = false)
         _queueData.update {
             it.copy(
                 data = queueData,
+                queueState = QueueData.StateSource.STATE_CREATED,
             )
         }
         // Snapshot which tracks came from the album, for the crossfade rule. Taken at load time
@@ -1895,6 +2054,33 @@ class JvmMediaPlayerHandlerImpl(
         // Once the track leaves its slot, everything after that slot shifts up by one: the slot
         // right after the current track is `current` for a track coming from behind it.
         moveQueueItem(position, if (position < current) current else current + 1)
+    }
+
+    override fun reshuffleRemainingQueue() {
+        val tracks = queueData.value.data.listTracks
+        val currentIdx = currentOrderIndex()
+        if (currentIdx < 0 || currentIdx >= tracks.size - 2) return
+        val tail = tracks.subList(currentIdx + 1, tracks.size)
+        val anchorArtist = tracks[currentIdx].artists?.firstOrNull()?.name
+        val reshuffledTail = smartArtistSpacedShuffle(tail, anchorArtist = anchorArtist)
+
+        val workingIds = tracks.mapTo(ArrayList(tracks.size)) { it.videoId }
+        for (offset in reshuffledTail.indices) {
+            val targetIdx = currentIdx + 1 + offset
+            val desiredId = reshuffledTail[offset].videoId
+            var currentPos = -1
+            for (scan in targetIdx until workingIds.size) {
+                if (workingIds[scan] == desiredId) {
+                    currentPos = scan
+                    break
+                }
+            }
+            if (currentPos > targetIdx) {
+                moveQueueItem(currentPos, targetIdx)
+                val moved = workingIds.removeAt(currentPos)
+                workingIds.add(targetIdx, moved)
+            }
+        }
     }
 
     /**
@@ -1938,6 +2124,8 @@ class JvmMediaPlayerHandlerImpl(
     }
 
     override fun reset() {
+        loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs()
         _queueData.value = QueueData()
     }
 
@@ -1964,6 +2152,11 @@ class JvmMediaPlayerHandlerImpl(
         isAddToQueue: Boolean,
     ) {
         Logger.d("Queue", listTrack.map { it.title }.toString())
+        val startEmptyPlayer =
+            isAddToQueue &&
+                queueData.value.data.listTracks.isEmpty() &&
+                player.mediaItemCount == 0
+        var startedEmptyPlayer = false
         _queueData.update {
             it.copy(
                 queueState = QueueData.StateSource.STATE_INITIALIZING,
@@ -2009,7 +2202,7 @@ class JvmMediaPlayerHandlerImpl(
                                         ),
                                 ),
                             )
-                            addMediaItemNotSet(
+                            val mediaItem =
                                 GenericMediaItem(
                                     mediaId = track.videoId,
                                     uri = track.videoId,
@@ -2022,8 +2215,13 @@ class JvmMediaPlayerHandlerImpl(
                                             description = if (isSong) MERGING_DATA_TYPE.SONG else MERGING_DATA_TYPE.VIDEO,
                                         ),
                                     customCacheKey = track.videoId,
-                                ),
-                            )
+                                )
+                            if (startEmptyPlayer && !startedEmptyPlayer) {
+                                startedEmptyPlayer = true
+                                addMediaItem(mediaItem, playWhenReady = true)
+                            } else {
+                                addMediaItemNotSet(mediaItem)
+                            }
                         } else {
                             val mediaItem =
                                 GenericMediaItem(
@@ -2039,7 +2237,12 @@ class JvmMediaPlayerHandlerImpl(
                                         ),
                                     customCacheKey = track.videoId,
                                 )
-                            addMediaItemNotSet(mediaItem)
+                            if (startEmptyPlayer && !startedEmptyPlayer) {
+                                startedEmptyPlayer = true
+                                addMediaItem(mediaItem, playWhenReady = true)
+                            } else {
+                                addMediaItemNotSet(mediaItem)
+                            }
                             catalogMetadata.add(
                                 track.copy(
                                     artists = listOf(Artist("", "Various Artists")),
@@ -2048,7 +2251,7 @@ class JvmMediaPlayerHandlerImpl(
                         }
                     }
             } else {
-                addMediaItemNotSet(
+                val mediaItem =
                     GenericMediaItem(
                         mediaId = track.videoId,
                         uri = track.videoId,
@@ -2061,8 +2264,13 @@ class JvmMediaPlayerHandlerImpl(
                                 description = if (isSong) MERGING_DATA_TYPE.SONG else MERGING_DATA_TYPE.VIDEO,
                             ),
                         customCacheKey = track.videoId,
-                    ),
-                )
+                    )
+                if (startEmptyPlayer && !startedEmptyPlayer) {
+                    startedEmptyPlayer = true
+                    addMediaItem(mediaItem, playWhenReady = true)
+                } else {
+                    addMediaItemNotSet(mediaItem)
+                }
                 catalogMetadata.add(track)
             }
             Logger.d(
@@ -2074,7 +2282,7 @@ class JvmMediaPlayerHandlerImpl(
         // Intent, not observed: isPlaying is also false while paused OR while the next track
         // is still preparing, so reading it here let a background queue append strip a live
         // play-intent mid-load and the incoming track came up silent.
-        if (!player.playWhenReady && isAddToQueue) {
+        if (!startedEmptyPlayer && !player.playWhenReady && isAddToQueue) {
             player.playWhenReady = false
         }
         _queueData.update {
@@ -2295,7 +2503,7 @@ class JvmMediaPlayerHandlerImpl(
             _queueData.update {
                 it.addTrackList(catalogMetadata)
             }
-            delay(200)
+            // removed artificial 200ms catalog delay
         }
         if (current != null && index != null) {
             _queueData.update {
@@ -2308,6 +2516,10 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun addQueueToPlayer() {
         loadJob?.cancel()
+        getRelatedJob?.cancel()
+        getRelatedJob = null
+        loadMoreJob?.cancel()
+        loadMoreJob = null
         loadJob =
             coroutineScope.launch {
                 load()
@@ -2316,6 +2528,10 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun loadPlaylistOrAlbum(index: Int?) {
         loadJob?.cancel()
+        getRelatedJob?.cancel()
+        getRelatedJob = null
+        loadMoreJob?.cancel()
+        loadMoreJob = null
         loadJob =
             coroutineScope.launch {
                 load(index = index)
@@ -2458,18 +2674,29 @@ class JvmMediaPlayerHandlerImpl(
                 is SongEntity -> anyTrack.toTrack()
                 else -> return
             }
-        if (track.isExplicit && runBlocking { dataStoreManager.explicitContentEnabled.first() } == FALSE) {
+        val gen = loadMediaItemGeneration.incrementAndGet()
+        cancelQueueLoadingJobs()
+        if (track.isExplicit && dataStoreManager.explicitContentEnabled.first() == FALSE) {
             showToast(ToastType.ExplicitContent)
             return
         }
-        songRepository.insertSong(track.toSongEntity()).singleOrNull()?.let {
-            Logger.d(TAG, "Inserted song: ${track.title}")
-        }
-        clearMediaItems()
-        track.durationSeconds?.let {
-            songRepository.updateDurationSeconds(it, track.videoId)
+        if (loadMediaItemGeneration.get() != gen) return
+        _queueData.update {
+            it.copy(
+                queueState = QueueData.StateSource.STATE_CREATED,
+            )
         }
         addMediaItem(track.toGenericMediaItem(), playWhenReady = type != RECOVER_TRACK_QUEUE)
+        backgroundScope.launch {
+            runCatching {
+                songRepository.insertSong(track.toSongEntity()).singleOrNull()?.let {
+                    Logger.d(TAG, "Inserted song: ${track.title}")
+                }
+                track.durationSeconds?.let {
+                    songRepository.updateDurationSeconds(it, track.videoId)
+                }
+            }
+        }
         when (type) {
             SONG_CLICK, VIDEO_CLICK, SHARE -> {
                 getRelated(track.videoId)
@@ -2484,6 +2711,8 @@ class JvmMediaPlayerHandlerImpl(
     override fun getPlayerDuration(): Long = player.duration
 
     override fun getProgress(): Long = player.currentPosition
+
+    private var saveQueueJob: Job? = null
 
     override fun mayBeSaveRecentSong(runBlocking: Boolean) {
         val unit =
@@ -2506,17 +2735,21 @@ class JvmMediaPlayerHandlerImpl(
                             ?.title
                             .toString(),
                     )
-                    val temp: ArrayList<Track> = ArrayList()
-                    temp.clear()
-                    temp.addAll(_queueData.value.data.listTracks)
-                    Logger.i("Check recover queue", "Saved ${temp.size} tracks for the next launch")
+                    val temp: ArrayList<Track> = ArrayList(_queueData.value.data.listTracks)
+                    Logger.d("Check recover queue", "Saved ${temp.size} tracks for the next launch")
                     songRepository.recoverQueue(temp)
                 }
             }
         if (runBlocking) {
+            saveQueueJob?.cancel()
             runBlocking { unit() }
         } else {
-            coroutineScope.launch { unit() }
+            saveQueueJob?.cancel()
+            saveQueueJob =
+                coroutineScope.launch {
+                    delay(250L)
+                    unit()
+                }
         }
     }
 
@@ -2691,6 +2924,21 @@ class JvmMediaPlayerHandlerImpl(
             // isPlaying — so no state is ever published and the UI sits at 0:00 on a
             // queue the user left half-finished, until they press play.
             _simpleMediaState.value = SimpleMediaState.Progress(savedPosition)
+            if (!playWhenReady) {
+                val warmVideoId = currentPlayingTrack.videoId
+                backgroundScope.launch {
+                    delay(250)
+                    runCatching {
+                        streamRepository
+                            .getStream(
+                                dataStoreManager,
+                                warmVideoId,
+                                isDownloading = false,
+                                isVideo = false,
+                            ).lastOrNull()
+                    }
+                }
+            }
             true
         }
 
@@ -2743,8 +2991,7 @@ class JvmMediaPlayerHandlerImpl(
             toggleLikeJob = null
             updateNotificationJob?.cancel()
             updateNotificationJob = null
-            loadJob?.cancel()
-            loadJob = null
+            cancelQueueLoadingJobs()
             songEntityJob?.cancel()
             songEntityJob = null
             getSkipSegmentsJob?.cancel()
@@ -2851,6 +3098,37 @@ class JvmMediaPlayerHandlerImpl(
     ) {
         resetPositionSmoothing()
         Logger.w(TAG, "Checking current state before transition ${simpleMediaState.value}")
+        if (mediaItem != null) {
+            val matchedTrack = queueData.value.data.listTracks.firstOrNull { it.videoId == mediaItem.mediaId }
+            val isBlocked =
+                currentBlocklist.isSongIdBlocked(mediaItem.mediaId) ||
+                    (matchedTrack != null && currentBlocklist.isTrackBlocked(matchedTrack))
+            val maxSkips = (queueData.value.data.listTracks.size - 1).coerceAtLeast(0)
+            if (isBlocked && blockedSkipStreak < maxSkips && player.hasNextMediaItem()) {
+                blockedSkipStreak += 1
+                coroutineScope.launch(mainDispatcher) {
+                    if (player.hasNextMediaItem()) {
+                        player.seekToNext()
+                    }
+                }
+                return
+            }
+        }
+        blockedSkipStreak = 0
+        val transitionedId = mediaItem?.mediaId
+        if (transitionedId != null && transitionedId != lastTransitionMediaId) {
+            lastTransitionMediaId = transitionedId
+            if (sleepSongsRemaining > 1) {
+                sleepSongsRemaining -= 1
+                if (sleepSongsRemaining == 1) {
+                    sleepStart(Int.MAX_VALUE)
+                } else {
+                    _sleepTimerState.update {
+                        it.copy(isDone = false, timeRemaining = -1, songsRemaining = sleepSongsRemaining)
+                    }
+                }
+            }
+        }
         val lastPlayed = nowPlayingState.value.songEntity
         val currentState = simpleMediaState.value
         if (currentState is SimpleMediaState.Progress && lastPlayed != null && lastPlayed.durationSeconds > 0) {

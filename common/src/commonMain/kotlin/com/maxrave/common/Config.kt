@@ -279,6 +279,9 @@ object ITAG {
      */
     const val AUDIO_AAC_HIGH: Int = 141
 
+    /** AAC 128 kbps, adaptive audio (M4A) — standard AAC adaptive audio stream. */
+    const val AUDIO_AAC_MEDIUM: Int = 140
+
     /** H.264 360p, adaptive video — what the "360p" video-quality setting selects. */
     const val VIDEO_360P: Int = 134
 
@@ -292,7 +295,7 @@ object ITAG {
     const val MUXED_360P: Int = 18
 
     /** Every adaptive audio itag the app knows how to play. */
-    val AUDIO: Set<Int> = setOf(AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH)
+    val AUDIO: Set<Int> = setOf(AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH, AUDIO_AAC_MEDIUM)
 
     /** Every adaptive video itag the app knows how to play. */
     val VIDEO: Set<Int> = setOf(VIDEO_1080P, VIDEO_720P, VIDEO_360P)
@@ -686,6 +689,7 @@ enum class LibraryChipType {
     YOUR_LIBRARY,
     WRAPPED,
     CHART,
+    SPOTIFY_PLAYLIST,
     YOUTUBE_MUSIC_PLAYLIST,
     YOUTUBE_MIX_FOR_YOU,
     LOCAL_PLAYLIST,
@@ -699,6 +703,7 @@ enum class LibraryChipType {
             YOUR_LIBRARY -> "your_library"
             YOUTUBE_MUSIC_PLAYLIST -> "youtube_music_playlist"
             YOUTUBE_MIX_FOR_YOU -> "youtube_mix_for_you"
+            SPOTIFY_PLAYLIST -> "spotify_playlist"
             LOCAL_PLAYLIST -> "local_playlist"
             FAVORITE_PLAYLIST -> "favorite_playlist"
             DOWNLOADED_PLAYLIST -> "downloaded_playlist"
@@ -713,6 +718,7 @@ enum class LibraryChipType {
                 "your_library" -> YOUR_LIBRARY
                 "youtube_music_playlist" -> YOUTUBE_MUSIC_PLAYLIST
                 "youtube_mix_for_you" -> YOUTUBE_MIX_FOR_YOU
+                "spotify_playlist" -> SPOTIFY_PLAYLIST
                 "local_playlist" -> LOCAL_PLAYLIST
                 "favorite_playlist" -> FAVORITE_PLAYLIST
                 "downloaded_playlist" -> DOWNLOADED_PLAYLIST

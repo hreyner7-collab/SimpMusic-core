@@ -124,7 +124,7 @@ internal class DownloadUtils(
                             resolved = true
                         }
                 } else {
-                    streamRepository.getNewFormat(mediaId).lastOrNull()?.let {
+                    streamRepository.getMatchingNewFormat(mediaId, dataStoreManager, isDownloading = true)?.let {
                         val audioUrl = it.audioUrl
                         if (audioUrl != null && it.expiredTime > now()) {
                             Logger.d("Stream", audioUrl)

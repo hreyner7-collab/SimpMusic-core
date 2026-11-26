@@ -37,21 +37,23 @@ internal fun parsePlaylistData(
             is BrowseResponse.Header.MusicDetailHeaderRenderer -> {
                 title +=
                     header.title.runs
-                        ?.get(0)
+                        ?.firstOrNull()
                         ?.text
+                        .orEmpty()
                 Logger.d("PlaylistParser", "title: $title")
-                if (!header.subtitle.runs.isNullOrEmpty() && header.subtitle.runs?.size!! > 2) {
+                val subtitleRuns = header.subtitle.runs
+                if (!subtitleRuns.isNullOrEmpty() && subtitleRuns.size > 2) {
                     val author =
                         Author(
                             id =
-                                header.subtitle.runs
-                                    ?.get(2)
+                                subtitleRuns
+                                    .getOrNull(2)
                                     ?.navigationEndpoint
                                     ?.browseEndpoint
                                     ?.browseId ?: "",
                             name =
-                                header.subtitle.runs
-                                    ?.get(2)
+                                subtitleRuns
+                                    .getOrNull(2)
                                     ?.text ?: "",
                         )
                     listAuthor.add(author)
@@ -60,18 +62,16 @@ internal fun parsePlaylistData(
                 val secondSubtitle = header.secondSubtitle.runs
                 Logger.w("PlaylistParser", "secondSubtitle: $secondSubtitle")
                 if (!secondSubtitle.isNullOrEmpty() && secondSubtitle.size > 2) {
-                    duration += secondSubtitle.getOrNull(2)?.text
+                    duration += secondSubtitle.getOrNull(2)?.text.orEmpty()
                 }
                 Logger.d("PlaylistParser", "duration: $duration")
-                if (!header.description?.runs.isNullOrEmpty()) {
-                    for (run in header.description?.runs!!) {
-                        description += (run.text)
-                    }
+                header.description?.runs?.forEach { run ->
+                    description += run.text
                 }
-                if (!header.subtitle.runs.isNullOrEmpty() && header.subtitle.runs?.size!! > 4) {
+                if (!subtitleRuns.isNullOrEmpty() && subtitleRuns.size > 4) {
                     year =
-                        header.subtitle.runs
-                            ?.get(4)
+                        subtitleRuns
+                            .getOrNull(4)
                             ?.text ?: now().year.toString()
                 }
                 header.thumbnail.croppedSquareThumbnailRenderer
@@ -82,69 +82,44 @@ internal fun parsePlaylistData(
             }
 
             is BrowseResponse.Header.MusicEditablePlaylistDetailHeaderRenderer? -> {
+                val detailHeader = header?.header?.musicDetailHeaderRenderer
                 title +=
-                    header.header.musicDetailHeaderRenderer
+                    detailHeader
                         ?.title
                         ?.runs
-                        ?.get(0)
+                        ?.firstOrNull()
                         ?.text
+                        .orEmpty()
                 Logger.d("PlaylistParser", "title: $title")
+                val subtitleRuns = detailHeader?.subtitle?.runs
                 val author =
                     Author(
                         id =
-                            header.header.musicDetailHeaderRenderer
-                                ?.subtitle
-                                ?.runs
-                                ?.get(2)
+                            subtitleRuns
+                                ?.getOrNull(2)
                                 ?.navigationEndpoint
                                 ?.browseEndpoint
                                 ?.browseId
                                 ?: "",
                         name =
-                            header.header.musicDetailHeaderRenderer
-                                ?.subtitle
-                                ?.runs
-                                ?.get(2)
+                            subtitleRuns
+                                ?.getOrNull(2)
                                 ?.text ?: "",
                     )
                 listAuthor.add(author)
                 Logger.d("PlaylistParser", "author: $author")
-                if (header.header.musicDetailHeaderRenderer
-                        ?.secondSubtitle
-                        ?.runs
-                        ?.size!! > 4
-                ) {
-                    duration +=
-                        header.header.musicDetailHeaderRenderer
-                            ?.secondSubtitle
-                            ?.runs
-                            ?.get(4)
-                            ?.text
-                } else if (header.header.musicDetailHeaderRenderer
-                        ?.secondSubtitle
-                        ?.runs
-                        ?.size!! == 3
-                ) {
-                    duration +=
-                        header.header.musicDetailHeaderRenderer
-                            ?.secondSubtitle
-                            ?.runs
-                            ?.get(2)
-                            ?.text
+                val secondRuns = detailHeader?.secondSubtitle?.runs
+                val secondSize = secondRuns?.size ?: 0
+                if (secondSize > 4) {
+                    duration += secondRuns?.getOrNull(4)?.text.orEmpty()
+                } else if (secondSize == 3) {
+                    duration += secondRuns?.getOrNull(2)?.text.orEmpty()
                 }
                 Logger.d("PlaylistParser", "duration: $duration")
-                if (!header.header.musicDetailHeaderRenderer
-                        ?.description
-                        ?.runs
-                        .isNullOrEmpty()
-                ) {
-                    for (run in header.header.musicDetailHeaderRenderer
-                        ?.description
-                        ?.runs!!) {
-                        description += (run.text)
-                    }
+                detailHeader?.description?.runs?.forEach { run ->
+                    description += run.text
                 }
-                header.header.musicDetailHeaderRenderer
+                detailHeader
                     ?.thumbnail
                     ?.croppedSquareThumbnailRenderer
                     ?.thumbnail
@@ -155,17 +130,14 @@ internal fun parsePlaylistData(
 
             is SectionListRenderer.Content.MusicResponsiveHeaderRenderer? -> {
                 title +=
-                    header.title
+                    header?.title
                         ?.runs
                         ?.firstOrNull()
                         ?.text
+                        .orEmpty()
                 Logger.d("PlaylistParser", "title: $title")
-                val secondSubtitle = header.secondSubtitle?.runs
+                val secondSubtitle = header?.secondSubtitle?.runs
                 if (!secondSubtitle.isNullOrEmpty()) {
-                    /**
-                     * Fuck Kotlin
-                     * Ref: https://stackoverflow.com/q/48379981/20605098
-                     */
                     trackCount =
                         try {
                             if (secondSubtitle.size >= 5) {
@@ -190,7 +162,7 @@ internal fun parsePlaylistData(
                         }
                 }
                 year =
-                    header.subtitle
+                    header?.subtitle
                         ?.runs
                         ?.lastOrNull()
                         ?.text
@@ -198,13 +170,13 @@ internal fun parsePlaylistData(
                 val author =
                     Author(
                         id =
-                            header.straplineTextOne
+                            header?.straplineTextOne
                                 ?.runs
-                                ?.get(0)
+                                ?.firstOrNull()
                                 ?.navigationEndpoint
                                 ?.browseEndpoint
                                 ?.browseId
-                                ?: header.facepile
+                                ?: header?.facepile
                                     ?.avatarStackViewModel
                                     ?.rendererContext
                                     ?.commandContext
@@ -214,11 +186,11 @@ internal fun parsePlaylistData(
                                     ?.browseId
                                 ?: "",
                         name =
-                            header.straplineTextOne
+                            header?.straplineTextOne
                                 ?.runs
-                                ?.get(0)
+                                ?.firstOrNull()
                                 ?.text
-                                ?: header.facepile
+                                ?: header?.facepile
                                     ?.avatarStackViewModel
                                     ?.text
                                     ?.content
@@ -228,25 +200,19 @@ internal fun parsePlaylistData(
                 Logger.d("PlaylistParser", "author: $author")
                 Logger.w("PlaylistParser", "secondSubtitle: $secondSubtitle")
                 if (!secondSubtitle.isNullOrEmpty() && secondSubtitle.size > 4) {
-                    duration += secondSubtitle.getOrNull(4)?.text
+                    duration += secondSubtitle.getOrNull(4)?.text.orEmpty()
                 } else if (!secondSubtitle.isNullOrEmpty() && secondSubtitle.size == 3) {
-                    duration += secondSubtitle.getOrNull(2)?.text
+                    duration += secondSubtitle.getOrNull(2)?.text.orEmpty()
                 }
                 Logger.d("PlaylistParser", "duration: $duration")
-                if (!header.description
-                        ?.musicDescriptionShelfRenderer
-                        ?.description
-                        ?.runs
-                        .isNullOrEmpty()
-                ) {
-                    for (run in header.description
-                        ?.musicDescriptionShelfRenderer
-                        ?.description
-                        ?.runs!!) {
-                        description += (run.text)
+                header?.description
+                    ?.musicDescriptionShelfRenderer
+                    ?.description
+                    ?.runs
+                    ?.forEach { run ->
+                        description += run.text
                     }
-                }
-                header.thumbnail
+                header?.thumbnail
                     ?.musicThumbnailRenderer
                     ?.thumbnail
                     ?.thumbnails

@@ -5,6 +5,8 @@ import com.maxrave.domain.mediaservice.handler.DownloadHandler
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.notification.DesktopNotificationManager
 import com.maxrave.domain.repository.CacheRepository
+import com.simpmusic.media_jvm.cache.DesktopRollingCacheRepository
+import com.simpmusic.media_jvm.cache.RollingAudioCache
 import com.simpmusic.media_jvm.download.DownloadUtils
 import com.simpmusic.media_jvm.mpv.MpvPlayerAdapter
 import com.simpmusic.media_jvm.notification.NucleusDesktopNotificationManager
@@ -29,11 +31,18 @@ private val desktopPlayerModule =
             CoroutineScope(playerDispatcher + SupervisorJob())
         }
 
+        single<RollingAudioCache> {
+            RollingAudioCache(
+                dataStoreManager = get(),
+            )
+        }
+
         single<MpvPlayerAdapter> {
             MpvPlayerAdapter(
                 coroutineScope = get(named(SERVICE_SCOPE)),
                 dataStoreManager = get(),
                 streamRepository = get(),
+                rollingAudioCache = get(),
             )
         }
 
@@ -43,18 +52,7 @@ private val desktopPlayerModule =
         }
 
         single<CacheRepository> {
-            object : CacheRepository {
-                override suspend fun getCacheSize(cacheName: String): Long = 0L
-
-                override fun clearCache(cacheName: String) {}
-
-                override suspend fun getAllCacheKeys(cacheName: String): List<String> = emptyList()
-
-                // mpv streams straight from the network; Desktop keeps no song cache on disk.
-                override suspend fun getFullyCachedSongIds(): List<String> = emptyList()
-
-                override suspend fun removeCachedSong(videoId: String) {}
-            }
+            DesktopRollingCacheRepository(get())
         }
         single<DesktopNotificationManager> {
             NucleusDesktopNotificationManager(

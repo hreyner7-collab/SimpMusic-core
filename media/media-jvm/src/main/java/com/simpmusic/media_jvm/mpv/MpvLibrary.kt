@@ -113,6 +113,18 @@ interface MpvLibrary : Library {
     // ---- events ----
 
     /**
+     * `int mpv_request_log_messages(mpv_handle *ctx, const char *min_level);`
+     *
+     * Asks mpv to deliver its own log output as `MPV_EVENT_LOG_MESSAGE` events at or above
+     * [minLevel] ("fatal", "error", "warn", ...). Without this mpv's own explanation of why a
+     * file failed to open (HTTP 403, unknown format, audio device failure) is never seen.
+     */
+    fun mpv_request_log_messages(
+        ctx: Pointer,
+        minLevel: String,
+    ): Int
+
+    /**
      * `mpv_event *mpv_wait_event(mpv_handle *ctx, double timeout);`
      *
      * Returned as a raw [Pointer] rather than a mapped Structure: mpv reuses the same
@@ -557,6 +569,25 @@ open class MpvEventProperty(
     @JvmField var format: Int = 0
 
     @JvmField var data: Pointer? = null
+}
+
+/**
+ * `struct mpv_event_log_message` — client.h.
+ *
+ * LP64 layout: prefix@0, level@8, text@16, log_level@24 (int). The three strings are owned by mpv
+ * and valid only until the next `mpv_wait_event`, so they are copied out immediately.
+ */
+@Structure.FieldOrder("prefix", "level", "text", "log_level")
+open class MpvEventLogMessage(
+    pointer: Pointer? = null,
+) : Structure(pointer) {
+    @JvmField var prefix: Pointer? = null
+
+    @JvmField var level: Pointer? = null
+
+    @JvmField var text: Pointer? = null
+
+    @JvmField var log_level: Int = 0
 }
 
 /**

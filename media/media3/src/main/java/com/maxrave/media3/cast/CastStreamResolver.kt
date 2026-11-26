@@ -29,7 +29,7 @@ internal class CastStreamResolver(
 
     suspend fun resolve(mediaId: String): ResolvedStream? {
         val videoId = mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
-        streamRepository.getNewFormat(videoId).lastOrNull()?.let { format ->
+        streamRepository.getMatchingNewFormat(videoId, dataStoreManager)?.let { format ->
             val cachedUrl = format.audioUrl
             if (cachedUrl != null && format.expiredTime > now()) {
                 val is403 = streamRepository.is403Url(cachedUrl).firstOrNull() != false

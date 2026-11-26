@@ -39,6 +39,12 @@ interface MediaPlayerHandler {
     // Playback control
     suspend fun onPlayerEvent(playerEvent: PlayerEvent)
 
+    fun setShuffle(enabled: Boolean) {
+        if (player.shuffleModeEnabled != enabled) {
+            player.shuffleModeEnabled = enabled
+        }
+    }
+
     fun toggleRadio()
 
     fun toggleLike()
@@ -49,6 +55,8 @@ interface MediaPlayerHandler {
 
     // Sleep timer
     fun sleepStart(minutes: Int)
+
+    fun sleepAfterSongs(songCount: Int) {}
 
     fun sleepStop()
 
@@ -80,6 +88,8 @@ interface MediaPlayerHandler {
 
     // Queue management
     fun shufflePlaylist(randomTrackIndex: Int = 0)
+
+    fun reshuffleRemainingQueue() {}
 
     fun loadMore()
 
@@ -271,7 +281,11 @@ data class NowPlayingTrackState(
 data class SleepTimerState(
     val isDone: Boolean,
     val timeRemaining: Int,
-)
+    val songsRemaining: Int = 0,
+) {
+    val isActive: Boolean
+        get() = timeRemaining > 0 || timeRemaining == -1 || songsRemaining > 0
+}
 
 data class QueueData(
     val queueState: StateSource = StateSource.STATE_CREATED,

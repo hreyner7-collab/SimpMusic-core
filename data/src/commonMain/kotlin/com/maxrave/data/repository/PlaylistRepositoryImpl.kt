@@ -94,7 +94,7 @@ internal class PlaylistRepositoryImpl(
     override suspend fun updatePlaylistLiked(
         playlistId: String,
         likeStatus: Int,
-    ) = withContext(Dispatchers.Main) {
+    ) = withContext(Dispatchers.IO) {
         localDataSource.updatePlaylistLiked(
             likeStatus,
             playlistId,
@@ -104,7 +104,7 @@ internal class PlaylistRepositoryImpl(
     override suspend fun updatePlaylistInLibrary(
         inLibrary: LocalDateTime,
         playlistId: String,
-    ) = withContext(Dispatchers.Main) {
+    ) = withContext(Dispatchers.IO) {
         localDataSource.updatePlaylistInLibrary(
             inLibrary,
             playlistId,
@@ -114,7 +114,7 @@ internal class PlaylistRepositoryImpl(
     override suspend fun updatePlaylistDownloadState(
         playlistId: String,
         downloadState: Int,
-    ) = withContext(Dispatchers.Main) {
+    ) = withContext(Dispatchers.IO) {
         localDataSource.updatePlaylistDownloadState(
             downloadState,
             playlistId,
@@ -225,22 +225,20 @@ internal class PlaylistRepositoryImpl(
                             result.contents
                                 ?.singleColumnBrowseResultsRenderer
                                 ?.tabs
-                                ?.get(
-                                    0,
-                                )?.tabRenderer
+                                ?.firstOrNull()
+                                ?.tabRenderer
                                 ?.content
                                 ?.sectionListRenderer
                                 ?.contents
-                                ?.get(
-                                    0,
-                                )?.musicPlaylistShelfRenderer
+                                ?.firstOrNull()
+                                ?.musicPlaylistShelfRenderer
                                 ?.contents
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.secondaryContents
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicPlaylistShelfRenderer
                                     ?.contents
                         if (data != null) {
@@ -254,22 +252,22 @@ internal class PlaylistRepositoryImpl(
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicResponsiveHeaderRenderer
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicEditablePlaylistDetailHeaderRenderer
                                     ?.header
                                     ?.musicResponsiveHeaderRenderer
@@ -298,7 +296,8 @@ internal class PlaylistRepositoryImpl(
                             emit(Resource.Error("Continue param is null"))
                         }
                     }.onFailure { e ->
-                        Logger.e("Playlist Data", e.message ?: "Error")
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        Logger.e("Playlist Data", e.message ?: e::class.simpleName ?: "Error")
                         emit(Resource.Error(e.message.toString()))
                     }
             }
@@ -326,22 +325,20 @@ internal class PlaylistRepositoryImpl(
                             result.contents
                                 ?.singleColumnBrowseResultsRenderer
                                 ?.tabs
-                                ?.get(
-                                    0,
-                                )?.tabRenderer
+                                ?.firstOrNull()
+                                ?.tabRenderer
                                 ?.content
                                 ?.sectionListRenderer
                                 ?.contents
-                                ?.get(
-                                    0,
-                                )?.musicPlaylistShelfRenderer
+                                ?.firstOrNull()
+                                ?.musicPlaylistShelfRenderer
                                 ?.contents
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.secondaryContents
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicPlaylistShelfRenderer
                                     ?.contents
                         if (data != null) {
@@ -354,22 +351,22 @@ internal class PlaylistRepositoryImpl(
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicResponsiveHeaderRenderer
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicEditablePlaylistDetailHeaderRenderer
                                     ?.header
                                     ?.musicResponsiveHeaderRenderer
@@ -458,22 +455,20 @@ internal class PlaylistRepositoryImpl(
                             result.contents
                                 ?.singleColumnBrowseResultsRenderer
                                 ?.tabs
-                                ?.get(
-                                    0,
-                                )?.tabRenderer
+                                ?.firstOrNull()
+                                ?.tabRenderer
                                 ?.content
                                 ?.sectionListRenderer
                                 ?.contents
-                                ?.get(
-                                    0,
-                                )?.musicPlaylistShelfRenderer
+                                ?.firstOrNull()
+                                ?.musicPlaylistShelfRenderer
                                 ?.contents
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.secondaryContents
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicPlaylistShelfRenderer
                                     ?.contents
                         if (data != null) {
@@ -486,22 +481,22 @@ internal class PlaylistRepositoryImpl(
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicResponsiveHeaderRenderer
                                 ?: result.contents
                                     ?.twoColumnBrowseResultsRenderer
                                     ?.tabs
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.tabRenderer
                                     ?.content
                                     ?.sectionListRenderer
                                     ?.contents
-                                    ?.get(0)
+                                    ?.firstOrNull()
                                     ?.musicEditablePlaylistDetailHeaderRenderer
                                     ?.header
                                     ?.musicResponsiveHeaderRenderer

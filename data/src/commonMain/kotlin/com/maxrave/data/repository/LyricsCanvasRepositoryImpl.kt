@@ -163,11 +163,16 @@ internal class LyricsCanvasRepositoryImpl(
                         spotify
                             .getPersonalTokenWithTotp(dataStoreManager.spdc.first())
                             .onSuccess {
-                                spotifyPersonalToken = it.accessToken
-                                dataStoreManager.setSpotifyPersonalToken(spotifyPersonalToken)
-                                dataStoreManager.setSpotifyPersonalTokenExpires(
-                                    it.accessTokenExpirationTimestampMs,
-                                )
+                                if (!it.isAnonymous && it.accessToken.isNotBlank()) {
+                                    spotifyPersonalToken = it.accessToken
+                                    dataStoreManager.setSpotifyPersonalToken(spotifyPersonalToken)
+                                    dataStoreManager.setSpotifyPersonalTokenExpires(
+                                        it.accessTokenExpirationTimestampMs,
+                                    )
+                                } else {
+                                    dataStoreManager.setSpotifyPersonalToken("")
+                                    dataStoreManager.setSpotifyPersonalTokenExpires(0L)
+                                }
                             }.onFailure {
                                 it.printStackTrace()
                                 emit(Resource.Error<CanvasResult>(it.message ?: "Not found"))
@@ -440,11 +445,16 @@ internal class LyricsCanvasRepositoryImpl(
                         spotify
                             .getPersonalTokenWithTotp(dataStoreManager.spdc.first())
                             .onSuccess {
-                                spotifyPersonalToken = it.accessToken
-                                dataStoreManager.setSpotifyPersonalToken(spotifyPersonalToken)
-                                dataStoreManager.setSpotifyPersonalTokenExpires(
-                                    it.accessTokenExpirationTimestampMs,
-                                )
+                                if (!it.isAnonymous && it.accessToken.isNotBlank()) {
+                                    spotifyPersonalToken = it.accessToken
+                                    dataStoreManager.setSpotifyPersonalToken(spotifyPersonalToken)
+                                    dataStoreManager.setSpotifyPersonalTokenExpires(
+                                        it.accessTokenExpirationTimestampMs,
+                                    )
+                                } else {
+                                    dataStoreManager.setSpotifyPersonalToken("")
+                                    dataStoreManager.setSpotifyPersonalTokenExpires(0L)
+                                }
                             }.onFailure {
                                 it.printStackTrace()
                                 emit(Resource.Error<Lyrics>("Not found"))
@@ -693,11 +703,19 @@ internal class LyricsCanvasRepositoryImpl(
         what: String,
         error: Throwable,
     ) {
+        if (error is kotlinx.coroutines.CancellationException) throw error
         val message = "$what: ${error.message}"
-        if ((error as? SimpMusicLyricsApiException)?.code == 404) {
-            Logger.d(simpMusicLyricsTag, message)
-        } else {
-            Logger.e(simpMusicLyricsTag, message)
+        val isTransientNetwork =
+            error.message?.let {
+                it.contains("Unable to resolve host", ignoreCase = true) ||
+                    it.contains("Socket timeout", ignoreCase = true) ||
+                    it.contains("Failed to connect", ignoreCase = true) ||
+                    it.contains("Connection reset", ignoreCase = true)
+            } == true
+        when {
+            (error as? SimpMusicLyricsApiException)?.code == 404 -> Logger.d(simpMusicLyricsTag, message)
+            (error as? SimpMusicLyricsApiException)?.code == 429 || isTransientNetwork -> Logger.w(simpMusicLyricsTag, message)
+            else -> Logger.e(simpMusicLyricsTag, message)
         }
     }
 
@@ -834,8 +852,8 @@ internal class LyricsCanvasRepositoryImpl(
                         albumName = track.album?.name ?: "",
                         durationSeconds = duration,
                         plainLyric = lyrics.toPlainLrcString() ?: "",
-                        syncedLyrics = syncedLyric,
-                        richSyncLyrics = richSyncedLyric,
+                        syncedLyrics = syncedLyric.orEmpty(),
+                        richSyncLyrics = richSyncedLyric.orEmpty(),
                         contributor = contributorName,
                         contributorEmail = contributorEmail,
                         trackType = if (track.thumbnails?.firstOrNull()?.let { it.width == it.height && it.width > 0 } == true) "SONG" else "VIDEO",
@@ -844,7 +862,12 @@ internal class LyricsCanvasRepositoryImpl(
                     Logger.d(simpMusicLyricsTag, "Inserted Lyrics: $it")
                     emit(Resource.Success(it.id))
                 }.onFailure {
-                    Logger.e(simpMusicLyricsTag, "Insert Lyrics Error: ${it.message}")
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    if ((it as? SimpMusicLyricsApiException)?.code == 429) {
+                        Logger.w(simpMusicLyricsTag, "Insert Lyrics Rate Limited: ${it.message}")
+                    } else {
+                        Logger.e(simpMusicLyricsTag, "Insert Lyrics Error: ${it.message}")
+                    }
                     emit(Resource.Error<String>(it.message ?: "Failed to insert lyrics"))
                 }
         }.flowOn(Dispatchers.IO)

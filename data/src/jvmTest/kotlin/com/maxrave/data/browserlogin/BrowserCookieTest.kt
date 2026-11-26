@@ -168,7 +168,7 @@ class BrowserCookieTest {
             record(".youtube.com", "other-path", "exclude", path = "/account"),
         )
         val result = BrowserCookieRecord.toYouTubeCookies(records, nowSeconds = 10)
-        assertEquals("SAPISID=domain; music=include", result.cookie)
+        assertEquals("music=include; SAPISID=domain", result.cookie)
         assertFalse(result.netscapeCookie.contains("lookalike"))
         assertFalse(result.netscapeCookie.contains("expired"))
         assertTrue(result.netscapeCookie.contains("youtube.com\tFALSE\t/\tTRUE\t0\thost-only\texclude"))

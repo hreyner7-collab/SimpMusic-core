@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.Flow
 interface CommonRepository {
     fun init(cookiePath: String, dataStoreManager: DataStoreManager, isDevBuild: Boolean = false)
 
+    suspend fun awaitCookieReady() {}
+
     // Database
     fun closeDatabase()
 

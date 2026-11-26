@@ -164,16 +164,15 @@ class Ytmusic {
 
     init {
         extractor.init()
+        extractor.warmUp()
     }
 
     @OptIn(ExperimentalSerializationApi::class)
     private fun createClient() =
         HttpClient(getEngine()) {
             expectSuccess = true
-            install(CurlLogger) {
-                logger = { Logger.d(TAG, it) }
-            }
-            // Every rejected sign-in on this client lands in the app log in one place. Host and path
+            // Speed: CurlLogger and Logging(LogLevel.ALL) cloned and printed every request/response
+            // body (and leaked cookies) on the hot path. Removed. sign-in on this client lands in the app log in one place. Host and path
             // only: the query and headers carry the cookie and the account.
             HttpResponseValidator {
                 handleResponseExceptionWithRequest { cause, request ->
@@ -188,10 +187,6 @@ class Ytmusic {
             install(HttpRedirect) {
                 checkHttpMethod = false
                 allowHttpsDowngrade = true
-            }
-            install(Logging) {
-                logger = io.ktor.client.plugins.logging.Logger.DEFAULT
-                level = LogLevel.ALL
             }
             install(ContentNegotiation) {
                 protobuf()
@@ -276,6 +271,8 @@ class Ytmusic {
         }
 
     fun getNewPipePlayer(videoId: String): List<Pair<Int, String>> = extractor.newPipePlayer(videoId)
+
+    fun invalidateExtractor() = extractor.invalidateDecoder()
 
     fun getLiveHlsUrl(videoId: String): String? = extractor.liveHlsUrl(videoId)
 
@@ -406,22 +403,30 @@ class Ytmusic {
     suspend fun liveStreamPlayer(
         videoId: String,
         anonymousVisitorData: String,
+    ) = anonymousClientPlayer(ANDROID, videoId, anonymousVisitorData)
+
+    suspend fun anonymousClientPlayer(
+        client: YouTubeClient,
+        videoId: String,
+        anonymousVisitorData: String?,
     ) = httpClient.post("https://www.youtube.com/youtubei/v1/player") {
-            contentType(ContentType.Application.Json)
-            header(HttpHeaders.UserAgent, ANDROID.userAgent)
-            header("X-YouTube-Client-Name", "${ANDROID.xClientName}")
-            header("X-YouTube-Client-Version", ANDROID.clientVersion)
+        contentType(ContentType.Application.Json)
+        header(HttpHeaders.UserAgent, client.userAgent)
+        header("X-YouTube-Client-Name", "${client.xClientName ?: client.clientName}")
+        header("X-YouTube-Client-Version", client.clientVersion)
+        if (!anonymousVisitorData.isNullOrBlank()) {
             header("X-Goog-Visitor-Id", anonymousVisitorData)
-            setBody(
-                PlayerBody(
-                    context = ANDROID.toContext(locale, anonymousVisitorData),
-                    videoId = videoId,
-                    playlistId = null,
-                    cpn = null,
-                ),
-            )
-            parameter("prettyPrint", false)
         }
+        setBody(
+            PlayerBody(
+                context = client.toContext(locale, anonymousVisitorData),
+                videoId = videoId,
+                playlistId = null,
+                cpn = null,
+            ),
+        )
+        parameter("prettyPrint", false)
+    }
 
     suspend fun noLogInPlayer(
         videoId: String,
@@ -464,7 +469,30 @@ class Ytmusic {
             contentType(ContentType.Application.Json)
         }
 
-    suspend fun test403Error(url: String): Boolean = httpClient.get(url).status.value in 200..299
+    /**
+     * Probes an extracted media URL with a real 64 KB byte-range GET (`bytes=0-65535`) and verifies
+     * both a 2xx status and actual media payload bytes (`>= 64` bytes). `googlevideo.com` answers
+     * `206` to 1-byte `bytes=0-0` and `200` to `HEAD` on unauthenticated `c=IOS` URLs that then
+     * reject real playback chunks with `403 Forbidden`, so a 1-byte or HEAD check is not sufficient.
+     */
+    suspend fun test403Error(url: String): Boolean =
+        try {
+            var ok = false
+            httpClient
+                .prepareRequest {
+                    url(url)
+                    header(HttpHeaders.Range, "bytes=0-65535")
+                }.execute { res ->
+                    if (res.status.value in 200..299) {
+                        val packet = res.bodyAsChannel().readRemaining(2048L)
+                        val bytes = packet.readByteArray()
+                        ok = bytes.size >= 64
+                    }
+                }
+            ok
+        } catch (_: Throwable) {
+            false
+        }
 
     suspend fun player(
         client: YouTubeClient,
@@ -718,7 +746,7 @@ class Ytmusic {
         }
 
     suspend fun checkForGithubReleaseUpdate() =
-        httpClient.get("https://api.github.com/repos/maxrave-dev/SimpMusic/releases/latest") {
+        httpClient.get("https://api.github.com/repos/hreyner7-collab/SimpMusic-HeyJarvis/releases/latest") {
             contentType(ContentType.Application.Json)
         }
 
@@ -1355,14 +1383,7 @@ class Ytmusic {
         onComplete(isSuccess, lastException)
     }
 
-    suspend fun is403Url(url: String): Boolean {
-        return try {
-            return httpClient.head(url).status.value in 400..499
-        } catch (e: Exception) {
-            e.printStackTrace()
-            true
-        }
-    }
+    suspend fun is403Url(url: String): Boolean = !test403Error(url)
 
     suspend fun getTidalOAuthToken() =
         httpClient.submitForm(

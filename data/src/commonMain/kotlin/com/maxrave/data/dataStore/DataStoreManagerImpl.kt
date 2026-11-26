@@ -937,6 +937,96 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val djCommentary: Flow<String> =
+        settingsDataStore.data.map { it[DJ_COMMENTARY] ?: TRUE }
+
+    override suspend fun setDjCommentary(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[DJ_COMMENTARY] = if (enabled) TRUE else FALSE }
+        }
+    }
+
+    override val djVoice: Flow<String> =
+        settingsDataStore.data.map { it[DJ_VOICE] ?: "NATURAL" }
+
+    override suspend fun setDjVoice(voice: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[DJ_VOICE] = voice }
+        }
+    }
+
+    override val djEnabled: Flow<String> =
+        settingsDataStore.data.map { it[DJ_ENABLED] ?: FALSE }
+
+    override suspend fun setDjEnabled(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[DJ_ENABLED] = if (enabled) TRUE else FALSE }
+        }
+    }
+
+    override val djEvery: Flow<Int> =
+        settingsDataStore.data.map { (it[DJ_EVERY]?.toIntOrNull() ?: 3).coerceIn(1, 10) }
+
+    override suspend fun setDjEvery(every: Int) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[DJ_EVERY] = every.coerceIn(1, 10).toString() }
+        }
+    }
+
+    override val stereoWidenEnabled: Flow<String> =
+        settingsDataStore.data.map { it[STEREO_WIDEN_ENABLED] ?: FALSE }
+
+    override suspend fun setStereoWidenEnabled(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[STEREO_WIDEN_ENABLED] = if (enabled) TRUE else FALSE }
+        }
+    }
+
+    override val stereoWidenAmount: Flow<Float> =
+        settingsDataStore.data.map { it[STEREO_WIDEN_AMOUNT]?.toFloatOrNull() ?: 0.5f }
+
+    override suspend fun setStereoWidenAmount(amount: Float) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[STEREO_WIDEN_AMOUNT] = amount.coerceIn(0f, 1f).toString() }
+        }
+    }
+
+    override val spotifyOAuthClientId: Flow<String> =
+        settingsDataStore.data.map { it[SPOTIFY_OAUTH_CLIENT_ID] ?: "" }
+
+    override suspend fun setSpotifyOAuthClientId(clientId: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[SPOTIFY_OAUTH_CLIENT_ID] = clientId.trim() }
+        }
+    }
+
+    override val spotifyOAuthRefreshToken: Flow<String> =
+        settingsDataStore.data.map { it[SPOTIFY_OAUTH_REFRESH_TOKEN] ?: "" }
+
+    override suspend fun setSpotifyOAuthRefreshToken(token: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[SPOTIFY_OAUTH_REFRESH_TOKEN] = token }
+        }
+    }
+
+    override val spotifyOAuthAccessToken: Flow<String> =
+        settingsDataStore.data.map { it[SPOTIFY_OAUTH_ACCESS_TOKEN] ?: "" }
+
+    override suspend fun setSpotifyOAuthAccessToken(token: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[SPOTIFY_OAUTH_ACCESS_TOKEN] = token }
+        }
+    }
+
+    override val spotifyOAuthExpiresAt: Flow<Long> =
+        settingsDataStore.data.map { it[SPOTIFY_OAUTH_EXPIRES_AT] ?: 0L }
+
+    override suspend fun setSpotifyOAuthExpiresAt(expiresAtMs: Long) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { it[SPOTIFY_OAUTH_EXPIRES_AT] = expiresAtMs }
+        }
+    }
+
     override val homeLimit: Flow<Int> =
         settingsDataStore.data.map { preferences ->
             preferences[HOME_LIMIT] ?: 5
@@ -1004,7 +1094,7 @@ internal class DataStoreManagerImpl(
 
     override val nowPlayingStyle =
         settingsDataStore.data.map { preferences ->
-            preferences[NOW_PLAYING_STYLE] ?: DataStoreManager.NOW_PLAYING_STYLE_SPOTIFY
+            preferences[NOW_PLAYING_STYLE] ?: DataStoreManager.NOW_PLAYING_STYLE_APPLE_MUSIC
         }
 
     override suspend fun setNowPlayingStyle(style: String) {
@@ -1017,7 +1107,7 @@ internal class DataStoreManagerImpl(
 
     override val lyricsStyle =
         settingsDataStore.data.map { preferences ->
-            preferences[LYRICS_STYLE] ?: DataStoreManager.LYRICS_STYLE_CLASSIC
+            preferences[LYRICS_STYLE] ?: DataStoreManager.LYRICS_STYLE_APPLE_MUSIC
         }
 
     override suspend fun setLyricsStyle(style: String) {
@@ -1663,7 +1753,7 @@ internal class DataStoreManagerImpl(
     override val enableLiquidGlass: Flow<String>
         get() =
             settingsDataStore.data.map { preferences ->
-                preferences[LIQUID_GLASS] ?: FALSE
+                preferences[LIQUID_GLASS] ?: TRUE
             }
 
     override suspend fun setEnableLiquidGlass(enable: Boolean) {
@@ -1949,6 +2039,16 @@ internal class DataStoreManagerImpl(
         val SPOTIFY_CLIENT_TOKEN_EXPIRES = longPreferencesKey("spotify_client_token_expires")
         val SPOTIFY_PERSONAL_TOKEN = stringPreferencesKey("spotify_personal_token")
         val SPOTIFY_PERSONAL_TOKEN_EXPIRES = longPreferencesKey("spotify_personal_token_expires")
+        val DJ_COMMENTARY = stringPreferencesKey("dj_commentary")
+        val DJ_VOICE = stringPreferencesKey("dj_voice")
+        val DJ_ENABLED = stringPreferencesKey("dj_enabled")
+        val DJ_EVERY = stringPreferencesKey("dj_every")
+        val STEREO_WIDEN_ENABLED = stringPreferencesKey("stereo_widen_enabled")
+        val STEREO_WIDEN_AMOUNT = stringPreferencesKey("stereo_widen_amount")
+        val SPOTIFY_OAUTH_CLIENT_ID = stringPreferencesKey("spotify_oauth_client_id")
+        val SPOTIFY_OAUTH_REFRESH_TOKEN = stringPreferencesKey("spotify_oauth_refresh_token")
+        val SPOTIFY_OAUTH_ACCESS_TOKEN = stringPreferencesKey("spotify_oauth_access_token")
+        val SPOTIFY_OAUTH_EXPIRES_AT = longPreferencesKey("spotify_oauth_expires_at")
         val TIDAL_CLIENT_ID = stringPreferencesKey("tidal_client_id")
         val TIDAL_CLIENT_SECRET = stringPreferencesKey("tidal_client_secret")
         val HOME_LIMIT = intPreferencesKey("home_limit")

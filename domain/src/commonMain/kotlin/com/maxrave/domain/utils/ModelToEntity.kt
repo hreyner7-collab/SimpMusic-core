@@ -125,7 +125,7 @@ fun Track.toSongEntity(): SongEntity {
         isExplicit = this.isExplicit,
         likeStatus = this.likeStatus ?: "",
         thumbnails =
-            this.thumbnails?.last()?.url?.let {
+            this.thumbnails?.lastOrNull()?.url?.let {
                 if (it.contains("w120")) {
                     return@let Regex("([wh])120").replace(it, "$1544")
                 } else if (it.contains("sddefault")) {
@@ -149,7 +149,7 @@ fun SongEntity.toTrack(): Track {
     val artistName = this.artistName
     if (artistName != null) {
         for (i in 0 until artistName.size) {
-            listArtist.add(Artist(this.artistId?.get(i) ?: "", artistName[i]))
+            listArtist.add(Artist(this.artistId?.getOrNull(i) ?: "", artistName[i]))
         }
     }
     val isSong = (this.thumbnails?.contains("w544") == true && this.thumbnails?.contains("h544") == true)
@@ -233,7 +233,7 @@ fun Content.toTrack(): Track =
         likeStatus = "INDIFFERENT",
         thumbnails = thumbnails,
         title = title,
-        videoId = videoId!!,
+        videoId = videoId ?: "",
         videoType = videoType,
         category = null,
         feedbackTokens = null,
@@ -278,7 +278,7 @@ fun AlbumBrowse.toAlbumEntity(id: String): AlbumEntity =
         description = this.description ?: "",
         duration = this.duration,
         durationSeconds = this.durationSeconds,
-        thumbnails = this.thumbnails?.last()?.url,
+        thumbnails = this.thumbnails?.lastOrNull()?.url,
         title = this.title,
         trackCount = this.trackCount,
         tracks = this.tracks.toListVideoId(),
@@ -294,7 +294,7 @@ fun PlaylistBrowse.toPlaylistEntity(): PlaylistEntity =
         duration = this.duration,
         durationSeconds = this.durationSeconds,
         privacy = this.privacy,
-        thumbnails = this.thumbnails.last().url,
+        thumbnails = this.thumbnails.lastOrNull()?.url ?: "",
         title = this.title,
         trackCount = this.trackCount,
         tracks = this.tracks.toListVideoId(),
@@ -394,7 +394,7 @@ fun Lyrics.toSyncedLrcString(): String? {
         return null
     }
     return lines.joinToString("\n") { line ->
-        val startTimeMs = line.startTimeMs.toLong()
+        val startTimeMs = line.startTimeMs.toLongOrNull() ?: 0L
         val minutes = (startTimeMs / 60000).toString().padStart(2, '0')
         val seconds = ((startTimeMs % 60000) / 1000).toString().padStart(2, '0')
         val milliseconds = ((startTimeMs % 1000) / 10).toString().padStart(2, '0')

@@ -21,24 +21,151 @@ import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.models.MediaType
 import com.maxrave.kotlinytmusicscraper.models.response.PlayerResponse
 import com.maxrave.logger.Logger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.datetime.LocalDateTime
 
 internal class StreamRepositoryImpl(
     private val localDataSource: LocalDataSource,
     private val youTube: YouTube,
 ) : StreamRepository {
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private data class CachedStreamUrl(
+        val url: String,
+        val expiresAt: LocalDateTime,
+    )
+
+    companion object {
+        @kotlin.concurrent.Volatile
+        private var tidalPausedUntil: LocalDateTime? = null
+
+        @kotlin.concurrent.Volatile
+        private var tidal429Streak: Int = 0
+    }
+
+    /** A stream lookup slower than this gets a second, racing attempt. */
+    private val HEDGE_AFTER_MS = 9000L
+
+    private val inFlightMutex = Mutex()
+    private val inFlightPlayers = HashMap<String, Deferred<Result<Triple<String?, PlayerResponse, MediaType>>>>()
+
+    private suspend fun playerSingleFlight(
+        videoId: String,
+        noLogIn: Boolean,
+        preferredAudioLanguage: String?,
+    ): Result<Triple<String?, PlayerResponse, MediaType>> {
+        val flightKey = "$videoId|$noLogIn|$preferredAudioLanguage"
+        val (deferred, isOwner) =
+            inFlightMutex.withLock {
+                val existing = inFlightPlayers[flightKey]
+                if (existing != null && existing.isActive) {
+                    existing to false
+                } else {
+                    val created =
+                        backgroundScope.async {
+                            hedged(HEDGE_AFTER_MS) {
+                                youTube.player(
+                                    videoId,
+                                    noLogIn = noLogIn,
+                                    preferredAudioLanguage = preferredAudioLanguage,
+                                )
+                            }
+                        }
+                    inFlightPlayers[flightKey] = created
+                    created to true
+                }
+            }
+        return try {
+            kotlinx.coroutines.withTimeout(22_000L) {
+                deferred.await()
+            }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            if (isOwner) deferred.cancel()
+            Result.failure(Exception("Stream resolution timed out for $videoId"))
+        } finally {
+            if (isOwner) {
+                inFlightMutex.withLock {
+                    if (inFlightPlayers[flightKey] === deferred) {
+                        inFlightPlayers.remove(flightKey)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun <T> hedged(
+        afterMs: Long,
+        block: suspend () -> Result<T>,
+    ): Result<T> =
+        coroutineScope {
+            val all = listOf(async { block() }, async { delay(afterMs); block() })
+            val pending = all.toMutableList()
+            var last: Result<T>? = null
+            while (pending.isNotEmpty()) {
+                val (done, result) =
+                    select<Pair<Deferred<Result<T>>, Result<T>>> {
+                        pending.forEach { d -> d.onAwait { d to it } }
+                    }
+                pending.remove(done)
+                if (result.isSuccess) {
+                    all.forEach { it.cancel() }
+                    return@coroutineScope result
+                }
+                last = result
+            }
+            last!!
+        }
+
+    private val streamCacheMutex = Mutex()
+    private val streamUrlCache = LinkedHashMap<String, CachedStreamUrl>(64)
+
+    private suspend fun getCachedStreamUrl(key: String): String? =
+        streamCacheMutex.withLock {
+            val entry = streamUrlCache[key] ?: return null
+            if (entry.expiresAt.isBefore(now().plusSeconds(90))) {
+                streamUrlCache.remove(key)
+                null
+            } else {
+                entry.url
+            }
+        }
+
+    private suspend fun putCachedStreamUrl(
+        key: String,
+        url: String,
+        expiresInSeconds: Long,
+    ) {
+        if (expiresInSeconds <= 120L) return
+        streamCacheMutex.withLock {
+            if (streamUrlCache.size >= 120) {
+                val oldestKey = streamUrlCache.keys.firstOrNull()
+                if (oldestKey != null) streamUrlCache.remove(oldestKey)
+            }
+            streamUrlCache[key] = CachedStreamUrl(url = url, expiresAt = now().plusSeconds(expiresInSeconds))
+        }
+    }
     override suspend fun insertNewFormat(newFormat: NewFormatEntity) =
         withContext(Dispatchers.IO) {
             localDataSource.insertNewFormat(newFormat)
         }
 
-    override fun getNewFormat(videoId: String): Flow<NewFormatEntity?> = flow { emit(localDataSource.getNewFormat(videoId)) }.flowOn(Dispatchers.Main)
+    override fun getNewFormat(videoId: String): Flow<NewFormatEntity?> = flow { emit(localDataSource.getNewFormat(videoId)) }.flowOn(Dispatchers.IO)
 
     override suspend fun getFormatFlow(videoId: String) = localDataSource.getNewFormatAsFlow(videoId)
 
@@ -77,7 +204,8 @@ internal class StreamRepositoryImpl(
                         )
                         Logger.w("UpdateFormat", "Updated format for $videoId")
                     }.onFailure { throwable ->
-                        Logger.e("UpdateFormat", "Error: ${throwable.message}")
+                        if (throwable is kotlinx.coroutines.CancellationException) throw throwable
+                        Logger.w("UpdateFormat", "Skipped format refresh for $videoId: ${throwable.message ?: throwable::class.simpleName}")
                     }
             }
         }
@@ -97,8 +225,19 @@ internal class StreamRepositoryImpl(
                 } else {
                     QUALITY.itagOf(dataStoreManager.quality.first())
                 }
+            val preferredAudioLanguage = dataStoreManager.preferredAudioLanguage.first()
+            val streamCacheKey = "$videoId|$itag|$preferredAudioLanguage"
+            if (!isDownloading && !isVideo && !muxed) {
+                getCachedStreamUrl(streamCacheKey)?.let { cachedUrl ->
+                    Logger.d("Stream", "$videoId: cache hit")
+                    emit(cachedUrl)
+                    return@flow
+                }
+            }
             val videoItag =
-                if (!muxed) {
+                if (muxed) {
+                    ITAG.MUXED_360P
+                } else if (isVideo) {
                     VIDEO_QUALITY.itags.getOrNull(
                         VIDEO_QUALITY.items.indexOf(
                             if (isDownloading) {
@@ -110,21 +249,25 @@ internal class StreamRepositoryImpl(
                     )
                         ?: ITAG.VIDEO_360P
                 } else {
-                    ITAG.MUXED_360P
+                    ITAG.VIDEO_360P
                 }
-            youTube
-                .player(
-                    videoId,
-                    noLogIn = muxed,
-                    preferredAudioLanguage = dataStoreManager.preferredAudioLanguage.first(),
-                )
+            // A lookup that is still running after HEDGE_AFTER_MS is usually stuck on one slow
+            // server or a fallback step, so a second identical request races it; the first success wins.
+            // Deduplicated across concurrent callers per (videoId, noLogIn, preferredAudioLanguage).
+            playerSingleFlight(
+                videoId = videoId,
+                noLogIn = muxed,
+                preferredAudioLanguage = preferredAudioLanguage,
+            )
                 .onSuccess { data ->
                     val response = data.second
                     val isLive = response.videoDetails?.isLive == true
                     LiveStreamRegistry.recordLiveStatus(videoId, isLive)
                     // The song row follows, so the LIVE badge and the download gate know too —
                     // including when a broadcast has ended and its recording downloads normally.
-                    localDataSource.updateSongLiveStatus(videoId, isLive)
+                    backgroundScope.launch {
+                        runCatching { localDataSource.updateSongLiveStatus(videoId, isLive) }
+                    }
                     if (isLive && isDownloading) {
                         // Nothing to save: handing an endless HLS playlist to a downloader stores
                         // the playlist text as if it were the song. Emitting nothing fails the
@@ -169,11 +312,14 @@ internal class StreamRepositoryImpl(
                             ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
                     val audioTwinItag = ITAG.highQualityTwinOf(itag)
                     val audioFormat =
-                        formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
-                            formatList.find { it.itag == audioTwinItag }
-                        } else {
-                            formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
-                        }
+                        formatList.find { it.itag == itag && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            ?: audioTwinItag?.let { twin ->
+                                formatList.find { it.itag == twin && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            }
+                            ?: formatList.find { it.itag == ITAG.AUDIO_OPUS_MEDIUM && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            ?: formatList.find { it.itag == ITAG.AUDIO_AAC_MEDIUM && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            ?: formatList.find { it.isAudio && !it.url.isNullOrEmpty() && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            ?: formatList.find { it.itag == ITAG.MUXED_360P && !it.url.isNullOrEmpty() && !youTube.isManifestUrl(it.url.orEmpty()) }
                     var format =
                         if (isVideo) {
                             videoFormat
@@ -181,7 +327,13 @@ internal class StreamRepositoryImpl(
                             audioFormat
                         }
                     if (format == null) {
-                        format = formatList.lastOrNull { it.url.isNullOrEmpty().not() }
+                        format =
+                            if (!isVideo && !muxed) {
+                                formatList.lastOrNull { !it.url.isNullOrEmpty() && !youTube.isManifestUrl(it.url.orEmpty()) && it.isAudio }
+                                    ?: formatList.lastOrNull { !it.url.isNullOrEmpty() && !youTube.isManifestUrl(it.url.orEmpty()) }
+                            } else {
+                                formatList.lastOrNull { it.url.isNullOrEmpty().not() }
+                            }
                     }
                     if (muxed) {
                         format = formatList
@@ -198,119 +350,151 @@ internal class StreamRepositoryImpl(
                             (if (muxed) ", HLS" else "") +
                             ", expires in ${response.streamingData?.expiresInSeconds}s",
                     )
-                    val durationSecond = response.videoDetails?.lengthSeconds?.toIntOrNull()
-                    // AutoMix metadata from Tidal official API
-                    var tidalBpm: Int? = null
-                    var tidalMusicKey: String? = null
-                    var tidalKeyScale: String? = null
-                    if (!isVideo && durationSecond != null && data.third == MediaType.Song) {
-                        val title = response.videoDetails?.title ?: ""
-                        val author = response.videoDetails?.author ?: ""
-                        val q =
-                            "$title $author"
-                                .replace(
-                                    Regex("\\((feat\\.|ft.|cùng với|con|mukana|com|avec|合作音乐人: ) "),
-                                    " ",
-                                ).replace(
-                                    Regex("( và | & | и | e | und |, |和| dan)"),
-                                    " ",
-                                ).replace("  ", " ")
-                                .replace(Regex("([()])"), "")
-                                .replace(".", " ")
-                                .replace("  ", " ")
-                        Logger.d("Stream", "Search Tidal metadata for: $q")
-                        youTube
-                            .searchTidalMetadata(q, durationSecond)
-                            .onSuccess { metadata ->
-                                Logger.d("Stream", "Tidal metadata: $metadata")
-                                tidalBpm = metadata.bpm
-                                tidalMusicKey = metadata.musicKey
-                                tidalKeyScale = metadata.keyScale
-                            }.onFailure {
-                                Logger.e("Stream", "Tidal metadata error: ${it.message}", it)
-                            }
-                    }
-                    insertNewFormat(
-                        NewFormatEntity(
-                            videoId = if (VIDEO_QUALITY.itags.contains(format?.itag)) "${MERGING_DATA_TYPE.VIDEO}$videoId" else videoId,
-                            itag = format?.itag ?: itag,
-                            mimeType =
-                                Regex("""([^;]+);\s*codecs=["']([^"']+)["']""")
-                                    .find(
-                                        format?.mimeType ?: "",
-                                    )?.groupValues
-                                    ?.getOrNull(1) ?: format?.mimeType ?: "",
-                            codecs =
-                                Regex("""([^;]+);\s*codecs=["']([^"']+)["']""")
-                                    .find(
-                                        format?.mimeType ?: "",
-                                    )?.groupValues
-                                    ?.getOrNull(2) ?: format?.mimeType ?: "",
-                            bitrate = format?.bitrate,
-                            sampleRate = format?.audioSampleRate,
-                            contentLength = format?.contentLength,
-                            loudnessDb =
-                                response.playerConfig
-                                    ?.audioConfig
-                                    ?.loudnessDb
-                                    ?.toFloat(),
-                            lengthSeconds = response.videoDetails?.lengthSeconds?.toInt(),
-                            playbackTrackingVideostatsPlaybackUrl =
-                                response.playbackTracking?.videostatsPlaybackUrl?.baseUrl?.replace(
-                                    "https://s.youtube.com",
-                                    "https://music.youtube.com",
-                                ),
-                            playbackTrackingAtrUrl =
-                                response.playbackTracking?.atrUrl?.baseUrl?.replace(
-                                    "https://s.youtube.com",
-                                    "https://music.youtube.com",
-                                ),
-                            playbackTrackingVideostatsWatchtimeUrl =
-                                response.playbackTracking?.videostatsWatchtimeUrl?.baseUrl?.replace(
-                                    "https://s.youtube.com",
-                                    "https://music.youtube.com",
-                                ),
-                            cpn = data.first,
-                            expiredTime = now().plusSeconds(response.streamingData?.expiresInSeconds?.toLong() ?: 0L),
-                            audioUrl = if (muxed) response.streamingData?.hlsManifestUrl else format?.url,
-                            videoUrl = if (muxed) response.streamingData?.hlsManifestUrl else videoFormat?.url,
-                            bpm = tidalBpm,
-                            musicKey = tidalMusicKey,
-                            keyScale = tidalKeyScale,
-                        ),
-                    )
-                    if (data.first != null) {
-                        emit(
+                    val rangeEnd = format?.contentLength?.takeIf { it > 0 }
+                    val resolvedUrl =
+                        if (data.first != null) {
                             if (muxed) {
                                 response.streamingData?.hlsManifestUrl
                             } else {
                                 format?.url?.let { url ->
-                                    if (youTube.isManifestUrl(url)) {
-                                        url.plus("&cpn=${data.first}")
+                                    val withCpn = if (url.contains("cpn=")) url else "$url&cpn=${data.first}"
+                                    if (youTube.isManifestUrl(url) || withCpn.contains("range=") || rangeEnd == null) {
+                                        withCpn
                                     } else {
-                                        url.plus("&cpn=${data.first}&range=0-${format.contentLength ?: 10000000}")
+                                        "$withCpn&range=0-$rangeEnd"
                                     }
                                 }
-                            },
-                        )
-                    } else {
-                        emit(
+                            }
+                        } else {
                             if (muxed) {
                                 response.streamingData?.hlsManifestUrl
                             } else {
                                 format?.url?.let { url ->
-                                    if (youTube.isManifestUrl(url)) {
+                                    if (youTube.isManifestUrl(url) || url.contains("range=") || rangeEnd == null) {
                                         url
                                     } else {
-                                        url.plus("&range=0-${format.contentLength ?: 10000000}")
+                                        "$url&range=0-$rangeEnd"
                                     }
                                 }
-                            },
+                            }
+                        }
+                    if (!isDownloading && !isVideo && !muxed && resolvedUrl != null) {
+                        putCachedStreamUrl(
+                            streamCacheKey,
+                            resolvedUrl,
+                            response.streamingData?.expiresInSeconds?.toLong() ?: 0L,
                         )
                     }
+                    // Emit stream URL immediately so playback starts without waiting for Room DB or Tidal lookup.
+                    emit(resolvedUrl)
+                    val durationSecond = response.videoDetails?.lengthSeconds?.toIntOrNull()
+                    backgroundScope.launch {
+                        val formatEntity =
+                            NewFormatEntity(
+                                videoId = if (VIDEO_QUALITY.itags.contains(format?.itag)) "${MERGING_DATA_TYPE.VIDEO}$videoId" else videoId,
+                                itag = format?.itag ?: itag,
+                                mimeType =
+                                    Regex("""([^;]+);\s*codecs=["']([^"']+)["']""")
+                                        .find(
+                                            format?.mimeType ?: "",
+                                        )?.groupValues
+                                        ?.getOrNull(1) ?: format?.mimeType ?: "",
+                                codecs =
+                                    Regex("""([^;]+);\s*codecs=["']([^"']+)["']""")
+                                        .find(
+                                            format?.mimeType ?: "",
+                                        )?.groupValues
+                                        ?.getOrNull(2) ?: format?.mimeType ?: "",
+                                bitrate = format?.bitrate,
+                                sampleRate = format?.audioSampleRate,
+                                contentLength = format?.contentLength,
+                                loudnessDb =
+                                    response.playerConfig
+                                        ?.audioConfig
+                                        ?.loudnessDb
+                                        ?.toFloat(),
+                                lengthSeconds = response.videoDetails?.lengthSeconds?.toInt(),
+                                playbackTrackingVideostatsPlaybackUrl =
+                                    response.playbackTracking?.videostatsPlaybackUrl?.baseUrl?.replace(
+                                        "https://s.youtube.com",
+                                        "https://music.youtube.com",
+                                    ),
+                                playbackTrackingAtrUrl =
+                                    response.playbackTracking?.atrUrl?.baseUrl?.replace(
+                                        "https://s.youtube.com",
+                                        "https://music.youtube.com",
+                                    ),
+                                playbackTrackingVideostatsWatchtimeUrl =
+                                    response.playbackTracking?.videostatsWatchtimeUrl?.baseUrl?.replace(
+                                        "https://s.youtube.com",
+                                        "https://music.youtube.com",
+                                    ),
+                                cpn = data.first,
+                                expiredTime = now().plusSeconds(response.streamingData?.expiresInSeconds?.toLong() ?: 0L),
+                                audioUrl = if (muxed) response.streamingData?.hlsManifestUrl else format?.url,
+                                videoUrl = if (muxed) response.streamingData?.hlsManifestUrl else videoFormat?.url,
+                                bpm = null,
+                                musicKey = null,
+                                keyScale = null,
+                            )
+                        runCatching { insertNewFormat(formatEntity) }
+                        // After TIDAL answers "too many requests", further lookups only fail again and
+                        // compete with playback for the connection, so they pause for a while.
+                        val tidalPaused = tidalPausedUntil?.let { now().isBefore(it) } == true
+                        if (!isVideo && durationSecond != null && data.third == MediaType.Song && !tidalPaused) {
+                            val title = response.videoDetails?.title ?: ""
+                            val author = response.videoDetails?.author ?: ""
+                            val q =
+                                "$title $author"
+                                    .replace(
+                                        Regex("\\((feat\\.|ft.|cùng với|con|mukana|com|avec|合作音乐人: ) "),
+                                        " ",
+                                    ).replace(
+                                        Regex("( và | & | и | e | und |, |和| dan)"),
+                                        " ",
+                                    ).replace("  ", " ")
+                                    .replace(Regex("([()])"), "")
+                                    .replace(".", " ")
+                                    .replace("  ", " ")
+                            Logger.d("Stream", "Search Tidal metadata for: $q")
+                            youTube
+                                .searchTidalMetadata(q, durationSecond)
+                                .onSuccess { metadata ->
+                                    tidal429Streak = 0
+                                    Logger.d("Stream", "Tidal metadata: $metadata")
+                                    runCatching {
+                                        val current = localDataSource.getNewFormat(formatEntity.videoId)
+                                        if (current != null && !current.expiredTime.isBefore(now())) {
+                                            insertNewFormat(
+                                                current.copy(
+                                                    bpm = metadata.bpm,
+                                                    musicKey = metadata.musicKey,
+                                                    keyScale = metadata.keyScale,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                }.onFailure {
+                                    if (it is kotlinx.coroutines.CancellationException) throw it
+                                    if (it is InterruptedException) {
+                                        Thread.currentThread().interrupt()
+                                        Logger.d("Stream", "Tidal metadata interrupted")
+                                    } else if (it.message?.contains("429") == true) {
+                                        val backoffSeconds = minOf(300L * (1L shl tidal429Streak.coerceAtMost(3)), 3600L)
+                                        tidal429Streak++
+                                        tidalPausedUntil = now().plusSeconds(backoffSeconds)
+                                        Logger.w("Stream", "Tidal rate limited (429), pausing metadata lookups for ${backoffSeconds}s")
+                                    } else if (it.message == "No matching track found") {
+                                        Logger.d("Stream", "Tidal metadata: no match for $q")
+                                    } else {
+                                        Logger.w("Stream", "Tidal metadata unavailable: ${it.message ?: it::class.simpleName}")
+                                    }
+                                }
+                        }
+                    }
                 }.onFailure {
-                    it.printStackTrace()
-                    Logger.e("Stream", "Error: ${it.message}")
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    Logger.w("Stream", "Stream unavailable: ${it.message ?: it::class.simpleName}")
                     emit(null)
                 }
         }.flowOn(Dispatchers.IO)
@@ -328,7 +512,8 @@ internal class StreamRepositoryImpl(
                 .onSuccess { response ->
                     emit(response)
                 }.onFailure {
-                    Logger.e("InitPlayback", "Error: ${it.message}")
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    Logger.w("InitPlayback", "Skipped: ${it.message ?: it::class.simpleName}")
                     emit(Pair(0, 0f))
                 }
         }.flowOn(Dispatchers.IO)
@@ -402,6 +587,12 @@ internal class StreamRepositoryImpl(
 
     override suspend fun invalidateFormat(videoId: String) {
         withContext(Dispatchers.IO) {
+            youTube.invalidateExtractor()
+            streamCacheMutex.withLock {
+                val prefix = "$videoId|"
+                val keysToRemove = streamUrlCache.keys.filter { it.startsWith(prefix) }
+                keysToRemove.forEach { streamUrlCache.remove(it) }
+            }
             localDataSource.getNewFormat(videoId)?.let { format ->
                 Logger.d("Stream", "Invalidating cached format for $videoId")
                 localDataSource.updateNewFormat(

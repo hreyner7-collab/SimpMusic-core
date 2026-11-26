@@ -205,6 +205,11 @@ data class ReverbEffect(
 data class AudioEffects(
     val delay: DelayEffect?,
     val reverb: ReverbEffect?,
+    /**
+     * Stereo width factor, or null when the widener is off. 1.0 leaves the picture as recorded;
+     * above 1.0 the difference between the channels (what makes it feel wide) is scaled up.
+     */
+    val stereoWidth: Float? = null,
 ) {
     companion object {
         /** Nothing applied; hands every backend back to its plain path. */

@@ -1,16 +1,36 @@
 package com.maxrave.domain.repository
 
+import com.maxrave.common.QUALITY
 import com.maxrave.domain.data.entities.NewFormatEntity
+import com.maxrave.domain.data.entities.matchesAudioItag
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.utils.Resource
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.lastOrNull
 
 interface StreamRepository {
     suspend fun insertNewFormat(newFormat: NewFormatEntity)
 
     fun getNewFormat(videoId: String): Flow<NewFormatEntity?>
+
+    suspend fun getMatchingNewFormat(
+        videoId: String,
+        dataStoreManager: DataStoreManager,
+        isDownloading: Boolean = false,
+    ): NewFormatEntity? {
+        val targetItag =
+            QUALITY.itagOf(
+                if (isDownloading) {
+                    dataStoreManager.downloadQuality.first()
+                } else {
+                    dataStoreManager.quality.first()
+                },
+            )
+        return getNewFormat(videoId).lastOrNull()?.takeIf { it.matchesAudioItag(targetItag) }
+    }
 
     suspend fun getFormatFlow(videoId: String): Flow<NewFormatEntity?>
 

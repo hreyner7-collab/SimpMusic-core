@@ -8,6 +8,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okio.FileSystem
+import okio.Path
+import okio.SYSTEM
+import kotlin.concurrent.Volatile
 import kotlin.time.Clock
 
 /**
@@ -48,7 +52,7 @@ class FaradayCipherEngine(
     // disagree on sig/nClass/sts (checked 2026-10-27), so the order only decides which is asked first.
     private val stores =
         listOf(PLAYER_CONFIG_URL, METROLIST_PLAYER_CONFIG_URL).map {
-            RemotePlayerConfigStore(httpClient, InMemoryPlayerConfigRepository(it), logger)
+            RemotePlayerConfigStore(httpClient, DiskBackedPlayerConfigRepository(it), logger)
         }
 
     /**
@@ -65,6 +69,18 @@ class FaradayCipherEngine(
     private var cachedPlayerId: String? = null
     private var cachedPlayerIdAtMs: Long = 0L
     private var cachedSolver: CachedSolver? = null
+
+    @Volatile
+    private var currentSolverKey: String? = null
+
+    fun activeSolverKey(): String? = currentSolverKey
+
+    suspend fun warmUp() {
+        operationMutex.withLock {
+            val info = playerInfoLocked() ?: return@withLock
+            solverFor(info.playerId)
+        }
+    }
 
     private class CachedSolver(
         val playerId: String,
@@ -134,9 +150,11 @@ class FaradayCipherEngine(
         mutex.withLock {
             cachedPlayerId = null
             cachedPlayerIdAtMs = 0L
+            currentSolverKey = null
             cachedSolver?.solver?.dispose()
             cachedSolver = null
         }
+        deleteCipherCacheFile(PLAYER_ID_CACHE_FILE)
         stores.forEach { runCatching { it.refreshAfterStreamRejection() } }
     }
 
@@ -144,12 +162,19 @@ class FaradayCipherEngine(
         val now = Clock.System.now().toEpochMilliseconds()
         mutex.withLock {
             cachedPlayerId?.takeIf { now - cachedPlayerIdAtMs < PLAYER_ID_TTL_MS }?.let { return it }
+            readPersistedPlayerId(now)?.let { (persistedId, persistedAt) ->
+                cachedPlayerId = persistedId
+                cachedPlayerIdAtMs = persistedAt
+                return persistedId
+            }
         }
         val fetched = fetchPlayerId() ?: return null
+        val fetchedAt = Clock.System.now().toEpochMilliseconds()
         mutex.withLock {
             cachedPlayerId = fetched
-            cachedPlayerIdAtMs = Clock.System.now().toEpochMilliseconds()
+            cachedPlayerIdAtMs = fetchedAt
         }
+        persistPlayerId(fetched, fetchedAt)
         return fetched
     }
 
@@ -198,19 +223,24 @@ class FaradayCipherEngine(
 
         // Each store's epoch only grows, so the sum changes exactly when either table does.
         val epoch = stores.sumOf { it.configEpoch }
+        val key = "$playerId:$epoch"
         mutex.withLock {
             cachedSolver
                 ?.takeIf { it.playerId == playerId && it.configEpoch == epoch }
-                ?.let { return it.solver }
+                ?.let {
+                    currentSolverKey = key
+                    return it.solver
+                }
         }
 
         return try {
-            val playerCode = downloadPlayerCode(playerUrl) ?: return null
+            val playerCode = loadOrDownloadPlayerCode(playerId, playerUrl) ?: return null
             val created = ZemerCipherSolver.create(playerCode, config, jsThread)
             val replaced =
                 mutex.withLock {
                     val previous = cachedSolver
                     cachedSolver = CachedSolver(playerId, epoch, created)
+                    currentSolverKey = key
                     previous
                 }
             replaced?.solver?.dispose()
@@ -225,6 +255,20 @@ class FaradayCipherEngine(
             )
             null
         }
+    }
+
+    private suspend fun loadOrDownloadPlayerCode(
+        playerId: String,
+        playerUrl: String,
+    ): String? {
+        val cacheName = "base_$playerId.js"
+        readCipherCacheFile(cacheName)?.takeIf { it.isNotEmpty() }?.let { return it }
+        val downloaded = downloadPlayerCode(playerUrl) ?: return null
+        if (downloaded.isNotEmpty()) {
+            writeCipherCacheFile(cacheName, downloaded)
+            pruneOldPlayerScripts(keepFileName = cacheName)
+        }
+        return downloaded
     }
 
     private suspend fun downloadPlayerCode(playerUrl: String): String? =
@@ -273,17 +317,164 @@ class FaradayCipherEngine(
 
         private val PLAYER_HASH_REGEX = Regex("""player\\?/([a-z0-9]{8})\\?/""")
         private val PLAYER_ID_REGEX = Regex("^[A-Za-z0-9_-]{4,32}$")
+        private const val PLAYER_ID_CACHE_FILE = "player_id.txt"
+
+        internal fun cipherCacheDir(): Path = FileSystem.SYSTEM_TEMPORARY_DIRECTORY / "simpmusic-cipher"
+
+        private fun readCipherCacheFile(name: String): String? =
+            runCatching {
+                val path = cipherCacheDir() / name
+                if (!FileSystem.SYSTEM.exists(path)) return@runCatching null
+                FileSystem.SYSTEM.read(path) { readUtf8() }
+            }.getOrNull()
+
+        private fun writeCipherCacheFile(
+            name: String,
+            content: String,
+        ) {
+            runCatching {
+                val dir = cipherCacheDir()
+                FileSystem.SYSTEM.createDirectories(dir)
+                FileSystem.SYSTEM.write(dir / name) { writeUtf8(content) }
+            }
+        }
+
+        private fun deleteCipherCacheFile(name: String) {
+            runCatching {
+                val path = cipherCacheDir() / name
+                if (FileSystem.SYSTEM.exists(path)) FileSystem.SYSTEM.delete(path)
+            }
+        }
+
+        private fun pruneOldPlayerScripts(keepFileName: String) {
+            runCatching {
+                val dir = cipherCacheDir()
+                if (!FileSystem.SYSTEM.exists(dir)) return@runCatching
+                FileSystem.SYSTEM.list(dir).forEach { child ->
+                    val name = child.name
+                    if (name.startsWith("base_") && name.endsWith(".js") && name != keepFileName) {
+                        runCatching { FileSystem.SYSTEM.delete(child) }
+                    }
+                }
+            }
+        }
+
+        private fun readPersistedPlayerId(nowMs: Long): Pair<String, Long>? {
+            val raw = readCipherCacheFile(PLAYER_ID_CACHE_FILE) ?: return null
+            val sep = raw.indexOf('|')
+            if (sep <= 0) return null
+            val ts = raw.substring(0, sep).toLongOrNull() ?: return null
+            val id = raw.substring(sep + 1).trim()
+            if (nowMs - ts >= PLAYER_ID_TTL_MS || !PLAYER_ID_REGEX.matches(id)) return null
+            return id to ts
+        }
+
+        private fun persistPlayerId(
+            playerId: String,
+            fetchedAtMs: Long,
+        ) {
+            writeCipherCacheFile(PLAYER_ID_CACHE_FILE, "$fetchedAtMs|$playerId")
+        }
 
         internal fun playerUrlFor(playerId: String): String = "https://www.youtube.com/s/player/$playerId/player_ias.vflset/en_GB/base.js"
     }
 }
 
 /**
+ * Keeps the fetched table in memory AND persists it to [FileSystem.SYSTEM_TEMPORARY_DIRECTORY]/simpmusic-cipher
+ * so cold app starts skip downloading `player_configs.json` on the critical playback path.
+ */
+internal class DiskBackedPlayerConfigRepository(
+    private val url: String,
+) : PlayerConfigRepository {
+    override val enabled: Boolean = true
+    override val sourceUrl: String = url
+    override val defaultSourceUrl: String = url
+
+    private val cacheFileName: String = "player_cfg_${url.hashCode().toUInt().toString(16)}.cache"
+    private var loaded = false
+
+    private var _cachedJson: String = ""
+    private var _cachedAtMs: Long = 0L
+    private var _cachedSourceUrl: String = ""
+    private var _cachedEtag: String = ""
+
+    private fun ensureLoaded() {
+        if (loaded) return
+        loaded = true
+        runCatching {
+            val path = FaradayCipherEngine.cipherCacheDir() / cacheFileName
+            if (!FileSystem.SYSTEM.exists(path)) return
+            val text = FileSystem.SYSTEM.read(path) { readUtf8() }
+            val nl = text.indexOf('\n')
+            if (nl <= 0) return
+            val header = text.substring(0, nl).split('\t')
+            if (header.size < 3) return
+            _cachedAtMs = header[0].toLongOrNull() ?: 0L
+            _cachedSourceUrl = header[1]
+            _cachedEtag = header[2]
+            _cachedJson = text.substring(nl + 1)
+        }
+    }
+
+    private fun persist() {
+        runCatching {
+            val dir = FaradayCipherEngine.cipherCacheDir()
+            FileSystem.SYSTEM.createDirectories(dir)
+            val safeSource = _cachedSourceUrl.replace('\n', ' ').replace('\t', ' ')
+            val safeEtag = _cachedEtag.replace('\n', ' ').replace('\t', ' ')
+            val payload = "${_cachedAtMs}\t$safeSource\t$safeEtag\n$_cachedJson"
+            FileSystem.SYSTEM.write(dir / cacheFileName) { writeUtf8(payload) }
+        }
+    }
+
+    override var cachedJson: String
+        get() {
+            ensureLoaded()
+            return _cachedJson
+        }
+        set(value) {
+            ensureLoaded()
+            _cachedJson = value
+            persist()
+        }
+
+    override var cachedAtMs: Long
+        get() {
+            ensureLoaded()
+            return _cachedAtMs
+        }
+        set(value) {
+            ensureLoaded()
+            _cachedAtMs = value
+            persist()
+        }
+
+    override var cachedSourceUrl: String
+        get() {
+            ensureLoaded()
+            return _cachedSourceUrl
+        }
+        set(value) {
+            ensureLoaded()
+            _cachedSourceUrl = value
+            persist()
+        }
+
+    override var cachedEtag: String
+        get() {
+            ensureLoaded()
+            return _cachedEtag
+        }
+        set(value) {
+            ensureLoaded()
+            _cachedEtag = value
+            persist()
+        }
+}
+
+/**
  * Keeps the fetched table for the life of the process only.
- *
- * The table is ~46 kB and the store sends an `If-None-Match`, so a cold start costs one request that
- * usually answers 304. Persisting it would mean handing this module a storage dependency it does not
- * otherwise have.
  */
 internal class InMemoryPlayerConfigRepository(
     private val url: String,

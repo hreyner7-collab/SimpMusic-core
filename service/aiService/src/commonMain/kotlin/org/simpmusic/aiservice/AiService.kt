@@ -50,7 +50,12 @@ class AiService(
             }
 
             AIHost.CUSTOM_OPENAI -> {
-                val baseUrl = customBaseUrl ?: "https://api.openai.com/v1/"
+                // The client resolves "chat/completions" relative to this URL, so without a trailing
+                // slash the last path segment ("v1") is replaced instead of extended.
+                val baseUrl =
+                    (customBaseUrl?.takeIf { it.isNotBlank() } ?: "https://api.openai.com/v1/").let {
+                        if (it.endsWith("/")) it else "$it/"
+                    }
                 val config =
                     OpenAIConfig(
                         token = apiKey,
@@ -83,6 +88,58 @@ class AiService(
      * chat endpoint to `json_object` only), and a refused format fails the whole request. The
      * prompt asks for a bare JSON object instead, and [parseTasteReading] reads it leniently.
      */
+    /** Songs for a listener's request, as a JSON array of "Title - Artist" strings, or null. */
+    suspend fun djSuggest(prompt: String): String? {
+        val request =
+            chatCompletionRequest {
+                this.model = this@AiService.model
+                messages {
+                    system {
+                        content = DJ_PICK_PROMPT
+                    }
+                    user {
+                        content {
+                            text(prompt)
+                        }
+                    }
+                }
+            }
+        return openAI
+            .chatCompletion(request)
+            .choices
+            .firstOrNull()
+            ?.message
+            ?.content
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    /** One short spoken line from a radio-DJ persona, or null when the provider answers nothing. */
+    suspend fun djIntro(prompt: String): String? {
+        val request =
+            chatCompletionRequest {
+                this.model = this@AiService.model
+                messages {
+                    system {
+                        content = DJ_SYSTEM_PROMPT
+                    }
+                    user {
+                        content {
+                            text(prompt)
+                        }
+                    }
+                }
+            }
+        return openAI
+            .chatCompletion(request)
+            .choices
+            .firstOrNull()
+            ?.message
+            ?.content
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
     suspend fun describeTaste(input: TasteInput): TasteReading {
         val request =
             chatCompletionRequest {

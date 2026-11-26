@@ -51,6 +51,14 @@ interface MediaPlayerInterface {
     // Media item management
     fun setMediaItem(mediaItem: GenericMediaItem)
 
+    fun setMediaItem(
+        mediaItem: GenericMediaItem,
+        playWhenReady: Boolean,
+    ) {
+        this.playWhenReady = playWhenReady
+        setMediaItem(mediaItem)
+    }
+
     fun addMediaItem(mediaItem: GenericMediaItem)
 
     fun addMediaItem(

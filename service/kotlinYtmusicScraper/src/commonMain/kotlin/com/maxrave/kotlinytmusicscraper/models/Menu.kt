@@ -56,8 +56,9 @@ data class Menu(
 
             @Serializable
             data class ButtonRenderer(
-                val icon: Icon,
-                val navigationEndpoint: NavigationEndpoint,
+                val icon: Icon? = null,
+                val navigationEndpoint: NavigationEndpoint? = null,
+                val command: NavigationEndpoint? = null,
             )
         }
     }

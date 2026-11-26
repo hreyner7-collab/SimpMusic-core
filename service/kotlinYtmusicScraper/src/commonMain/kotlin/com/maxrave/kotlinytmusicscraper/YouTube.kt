@@ -93,6 +93,8 @@ import com.maxrave.kotlinytmusicscraper.parser.getReloadParams
 import com.maxrave.kotlinytmusicscraper.parser.getSuggestionSongItems
 import com.maxrave.kotlinytmusicscraper.parser.hasReloadParams
 import com.maxrave.logger.Logger
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import com.mohamedrejeb.ksoup.html.parser.KsoupHtmlHandler
 import com.mohamedrejeb.ksoup.html.parser.KsoupHtmlParser
 import io.ktor.client.call.body
@@ -1375,81 +1377,26 @@ class YouTube {
         videoId: String,
         tempRes: PlayerResponse,
         preferredAudioLanguage: String? = null,
+        preFetchedStreams: List<Pair<Int, String>>? = null,
     ): PlayerResponse? {
         val listUrlSig = mutableListOf<String>()
         var decodedSigResponse: PlayerResponse?
-        var sigResponse: PlayerResponse?
+        var sigResponse: PlayerResponse = tempRes
         Logger.d(TAG, "YouTube TempRes ${tempRes.playabilityStatus}")
-        if (tempRes.playabilityStatus.status != "OK") {
-            return null
-        } else {
-            sigResponse = tempRes
-        }
-        val streamsList = ytMusic.getNewPipePlayer(videoId).orderByAudioTrack(preferredAudioLanguage)
+        val rawStreams =
+            if (preFetchedStreams != null) {
+                preFetchedStreams
+            } else {
+                val raced = raceFastestYouTubeStreams(videoId)
+                if (sigResponse.videoDetails == null && raced?.videoDetails != null) {
+                    sigResponse = sigResponse.copy(videoDetails = raced.videoDetails)
+                }
+                raced?.streams ?: emptyList()
+            }
+        val streamsList = rawStreams.orderByAudioTrack(preferredAudioLanguage)
         if (streamsList.isEmpty()) return null
 
-        decodedSigResponse =
-            sigResponse.copy(
-                streamingData =
-                    sigResponse.streamingData?.copy(
-                        formats =
-                            sigResponse.streamingData.formats?.map { format ->
-                                val url = streamsList.find { it.first == format.itag }?.second
-                                format.copy(
-                                    url = url,
-                                    contentLength = url?.let(::contentLengthOf) ?: format.contentLength,
-                                )
-                            },
-                        adaptiveFormats =
-                            sigResponse.streamingData.adaptiveFormats.map { adaptiveFormats ->
-                                val url = streamsList.find { it.first == adaptiveFormats.itag }?.second
-                                adaptiveFormats.copy(
-                                    url = url,
-                                    contentLength = url?.let(::contentLengthOf) ?: adaptiveFormats.contentLength,
-                                )
-                            },
-                        hlsManifestUrl = streamsList.firstOrNull { it.first == 96 }?.second,
-                    ),
-            )
-        decodedSigResponse =
-            decodedSigResponse.copy(
-                streamingData =
-                    decodedSigResponse.streamingData?.copy(
-                        formats =
-                            decodedSigResponse.streamingData.formats?.let { formats ->
-                                val copy = formats.toMutableList()
-                                streamsList
-                                    .filter {
-                                        isManifestUrl(it.second)
-                                    }.forEach { manifest ->
-                                        copy.add(
-                                            PlayerResponse.StreamingData.Format(
-                                                itag = manifest.first,
-                                                url = manifest.second,
-                                                mimeType = "",
-                                                bitrate = 0,
-                                                width = if (manifest.first == 96) 1920 else 1080,
-                                                height = if (manifest.first == 96) 1080 else 720,
-                                                contentLength = 0,
-                                                quality = "",
-                                                fps = 0,
-                                                qualityLabel = "",
-                                                averageBitrate = 0,
-                                                audioQuality = "",
-                                                approxDurationMs = "",
-                                                audioSampleRate = 0,
-                                                audioChannels = 0,
-                                                loudnessDb = 0.0,
-                                                lastModified = 0,
-                                                signatureCipher = "",
-                                            ),
-                                        )
-                                    }
-                                copy.filter { it.itag != 0 }
-                                copy
-                            },
-                    ),
-            )
+        decodedSigResponse = mergeNewPipeStreams(sigResponse, streamsList)
         listUrlSig.addAll(
             (
                 decodedSigResponse
@@ -1469,16 +1416,206 @@ class YouTube {
             Logger.d(TAG, "YouTube NewPipe URL $it")
         }
         val randomUrl = listUrlSig.randomOrNull() ?: return null
-        if (listUrlSig.isNotEmpty() && !is403Url(randomUrl)) {
-            Logger.d(TAG, "YouTube NewPipe Found URL $randomUrl")
-            return decodedSigResponse
-        } else {
-            Logger.d(TAG, "YouTube NewPipe No URL Found")
-            return null
+        // Speed: Extractor.newPipePlayer already HEAD-checked a stream; a second blocking
+        // is403Url round-trip here only delayed every fresh track start.
+        Logger.d(TAG, "YouTube NewPipe Found URL $randomUrl")
+        return decodedSigResponse
+    }
+
+    fun isManifestUrl(url: String): Boolean = isManifestStreamUrl(url)
+
+    @kotlin.concurrent.Volatile
+    private var cachedAnonVisitorData: String? = null
+
+    @kotlin.concurrent.Volatile
+    private var cachedAnonVisitorAtMs: Long = 0L
+
+    fun invalidateExtractor() {
+        cachedAnonVisitorData = null
+        cachedAnonVisitorAtMs = 0L
+        ytMusic.invalidateExtractor()
+    }
+
+    @OptIn(ExperimentalTime::class)
+    private suspend fun getCachedAnonymousVisitorData(): String? {
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        val existing = cachedAnonVisitorData
+        if (!existing.isNullOrBlank() && nowMs - cachedAnonVisitorAtMs < 30 * 60 * 1000L) {
+            return existing
+        }
+        return visitorData()?.also { fresh ->
+            cachedAnonVisitorData = fresh
+            cachedAnonVisitorAtMs = nowMs
         }
     }
 
-    fun isManifestUrl(url: String): Boolean = url.contains(".m3u8") || url.contains(".mpd") || url.contains("manifest")
+    private data class RacedStreamResult(
+        val sourceLabel: String,
+        val streams: List<Pair<Int, String>>,
+        val videoDetails: PlayerResponse.VideoDetails? = null,
+    )
+
+    private suspend fun innerTubeClientStreams(
+        client: YouTubeClient,
+        label: String,
+        videoId: String,
+        anonVisitorData: String?,
+    ): RacedStreamResult? =
+        runCatching {
+            val response = ytMusic.anonymousClientPlayer(client, videoId, anonVisitorData).body<JsonObject>()
+            val status =
+                response["playabilityStatus"]
+                    ?.jsonObject
+                    ?.get("status")
+                    ?.jsonPrimitive
+                    ?.contentOrNull
+            if (status != "OK") {
+                Logger.d(TAG, "$label for $videoId answered $status")
+                return@runCatching null
+            }
+            val streamingDataObj = response["streamingData"]?.jsonObject ?: return@runCatching null
+            val pairs = mutableListOf<Pair<Int, String>>()
+            for (arrKey in listOf("adaptiveFormats", "formats")) {
+                val arr = streamingDataObj[arrKey] as? kotlinx.serialization.json.JsonArray ?: continue
+                for (elem in arr) {
+                    val obj = elem as? JsonObject ?: continue
+                    val itag = obj["itag"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: continue
+                    val url = obj["url"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: continue
+                    pairs.add(itag to url)
+                }
+            }
+            val hls = streamingDataObj["hlsManifestUrl"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            if (hls != null) pairs.add(96 to hls)
+            val audioCandidate =
+                pairs.firstOrNull { it.first in ITAG.AUDIO }?.second
+                    ?: pairs.firstOrNull { it.first in ITAG.VIDEO }?.second
+                    ?: return@runCatching null
+            if (!ytMusic.test403Error(audioCandidate)) {
+                Logger.d(TAG, "$label stream probe returned non-2xx for $videoId")
+                return@runCatching null
+            }
+            val vdObj = response["videoDetails"]?.jsonObject
+            val details =
+                vdObj?.let { vd ->
+                    PlayerResponse.VideoDetails(
+                        videoId = vd["videoId"]?.jsonPrimitive?.contentOrNull ?: videoId,
+                        title = vd["title"]?.jsonPrimitive?.contentOrNull,
+                        author = vd["author"]?.jsonPrimitive?.contentOrNull,
+                        channelId = vd["channelId"]?.jsonPrimitive?.contentOrNull ?: "",
+                        authorAvatar = null,
+                        authorSubCount = null,
+                        lengthSeconds = vd["lengthSeconds"]?.jsonPrimitive?.contentOrNull ?: "0",
+                        isLive = vd["isLive"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull(),
+                        musicVideoType = vd["musicVideoType"]?.jsonPrimitive?.contentOrNull,
+                        viewCount = vd["viewCount"]?.jsonPrimitive?.contentOrNull,
+                        thumbnail = com.maxrave.kotlinytmusicscraper.models.Thumbnails(emptyList()),
+                        description = vd["shortDescription"]?.jsonPrimitive?.contentOrNull,
+                    )
+                }
+            RacedStreamResult(sourceLabel = "FastRace · $label", streams = pairs.toList(), videoDetails = details)
+        }.getOrNull()
+
+    private suspend fun pipedMirrorStreams(
+        baseUrl: String,
+        label: String,
+        videoId: String,
+    ): RacedStreamResult? =
+        runCatching {
+            val response = ytMusic.pipedStreams(videoId, baseUrl).body<JsonObject>()
+            val pairs = mutableListOf<Pair<Int, String>>()
+            for (arrKey in listOf("audioStreams", "videoStreams")) {
+                val arr = response[arrKey] as? kotlinx.serialization.json.JsonArray ?: continue
+                val isAudioArr = arrKey == "audioStreams"
+                for (elem in arr) {
+                    val obj = elem as? JsonObject ?: continue
+                    val url = obj["url"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: continue
+                    val rawItag = obj["itag"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: -1
+                    val mime = obj["mimeType"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val codec = obj["codec"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val itag =
+                        inferStreamItag(
+                            rawItag = rawItag,
+                            isAudio = isAudioArr,
+                            mimeType = mime,
+                            codec = codec,
+                        )
+                    if (itag > 0) pairs.add(itag to url)
+                }
+            }
+            val hls = response["hls"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            if (hls != null) pairs.add(96 to hls)
+            val audioCandidate =
+                pairs.firstOrNull { it.first in ITAG.AUDIO }?.second
+                    ?: pairs.firstOrNull { it.first in ITAG.VIDEO }?.second
+                    ?: return@runCatching null
+            if (!ytMusic.test403Error(audioCandidate)) {
+                return@runCatching null
+            }
+            val durationSec = response["duration"]?.jsonPrimitive?.contentOrNull ?: "0"
+            val details =
+                PlayerResponse.VideoDetails(
+                    videoId = videoId,
+                    title = response["title"]?.jsonPrimitive?.contentOrNull,
+                    author = response["uploader"]?.jsonPrimitive?.contentOrNull,
+                    channelId = "",
+                    authorAvatar = null,
+                    authorSubCount = null,
+                    lengthSeconds = durationSec,
+                    isLive = response["livestream"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull(),
+                    musicVideoType = null,
+                    viewCount = null,
+                    thumbnail = com.maxrave.kotlinytmusicscraper.models.Thumbnails(emptyList()),
+                    description = null,
+                )
+            RacedStreamResult(sourceLabel = "FastRace · $label", streams = pairs.toList(), videoDetails = details)
+        }.getOrNull()
+
+    private suspend fun raceFastestYouTubeStreams(videoId: String): RacedStreamResult? {
+        val immediateAnonVisitor = cachedAnonVisitorData
+        val winner =
+            raceFirstNonNull(
+                listOf(
+                    {
+                        innerTubeClientStreams(YouTubeClient.VISIONOS, "VISIONOS", videoId, immediateAnonVisitor)
+                    },
+                    {
+                        val visitor =
+                            immediateAnonVisitor
+                                ?: runCatching { kotlinx.coroutines.withTimeoutOrNull(1800L) { getCachedAnonymousVisitorData() } }.getOrNull()
+                        innerTubeClientStreams(YouTubeClient.VISIONOS, "VISIONOS-VD", videoId, visitor)
+                    },
+                    {
+                        val pipeStreams =
+                            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                                runCatching { ytMusic.getNewPipePlayer(videoId) }.getOrNull()
+                            }
+                        if (!pipeStreams.isNullOrEmpty()) {
+                            val src = getExtractSource(videoId) ?: "PipePipe"
+                            RacedStreamResult(sourceLabel = src, streams = pipeStreams, videoDetails = null)
+                        } else {
+                            null
+                        }
+                    },
+                    {
+                        val visitor =
+                            immediateAnonVisitor
+                                ?: runCatching { kotlinx.coroutines.withTimeoutOrNull(1800L) { getCachedAnonymousVisitorData() } }.getOrNull()
+                        innerTubeClientStreams(YouTubeClient.ANDROID, "ANDROID", videoId, visitor)
+                    },
+                    {
+                        pipedMirrorStreams("https://pipedapi.kavin.rocks", "Piped", videoId)
+                    },
+                    {
+                        pipedMirrorStreams("https://api.piped.private.coffee", "Piped-Mirror", videoId)
+                    },
+                ),
+            )
+        if (winner != null) {
+            com.maxrave.kotlinytmusicscraper.extractor.ExtractSource.record(videoId, winner.sourceLabel)
+            Logger.i(TAG, "Stream race winner for $videoId: ${winner.sourceLabel} (${winner.streams.size} streams)")
+        }
+        return winner
+    }
 
     /**
      * The HLS playlist a live broadcast plays from — see [Ytmusic.liveStreamPlayer] for which
@@ -1559,76 +1696,129 @@ class YouTube {
                     }.joinToString("")
 
             var decodedSigResponse: PlayerResponse? = null
-            val tempRes =
-                ytMusic
-                    .player(
-                        WEB_REMIX,
-                        videoId,
-                        playlistId,
-                        cpn,
-                        signatureTimestamp =
-                            run {
-                                val today = Clock.System.todayIn(TimeZone.UTC)
-                                val epoch =
-                                    Instant
-                                        .fromEpochSeconds(0)
-                                        .toLocalDateTime(TimeZone.UTC)
-                                        .date
-                                epoch.daysUntil(today)
-                            },
-                    ).body<PlayerResponse>()
-                    .let {
-                        val fexp =
-                            it.streamingData
-                                ?.serverAbrStreamingUrl
-                                ?.toKmpUri()
-                                ?.getQueryParameter("fexp")
-                        val playbackTracking = it.playbackTracking
-                        it.copy(
-                            playbackTracking =
-                                playbackTracking?.copy(
-                                    atrUrl =
-                                        playbackTracking.atrUrl?.copy(
-                                            baseUrl =
-                                                playbackTracking.atrUrl.baseUrl
+            val (tempRes, preFetchedStreams) =
+                coroutineScope {
+                    val racedDeferred =
+                        async(Dispatchers.Default) {
+                            runCatching { raceFastestYouTubeStreams(videoId) }.getOrNull()
+                        }
+                    val webRemixDeferred =
+                        async(Dispatchers.Default) {
+                            runCatching {
+                                kotlinx.coroutines.withTimeout(4500L) {
+                                    ytMusic
+                                        .player(
+                                            WEB_REMIX,
+                                            videoId,
+                                            playlistId,
+                                            cpn,
+                                            signatureTimestamp =
+                                                run {
+                                                    val today = Clock.System.todayIn(TimeZone.UTC)
+                                                    val epoch =
+                                                        Instant
+                                                            .fromEpochSeconds(0)
+                                                            .toLocalDateTime(TimeZone.UTC)
+                                                            .date
+                                                    epoch.daysUntil(today)
+                                                },
+                                        ).body<PlayerResponse>()
+                                        .let {
+                                            val fexp =
+                                                it.streamingData
+                                                    ?.serverAbrStreamingUrl
                                                     ?.toKmpUri()
-                                                    ?.buildUpon()
-                                                    ?.apply {
-                                                        if (fexp != null) {
-                                                            appendQueryParameter("fexp", fexp)
-                                                        }
-                                                    }?.build()
-                                                    ?.toString(),
-                                        ),
-                                    videostatsPlaybackUrl =
-                                        playbackTracking.videostatsPlaybackUrl?.copy(
-                                            baseUrl =
-                                                playbackTracking.videostatsPlaybackUrl.baseUrl
-                                                    ?.toKmpUri()
-                                                    ?.buildUpon()
-                                                    ?.apply {
-                                                        if (fexp != null) {
-                                                            appendQueryParameter("fexp", fexp)
-                                                        }
-                                                    }?.build()
-                                                    ?.toString(),
-                                        ),
-                                    videostatsWatchtimeUrl =
-                                        playbackTracking.videostatsWatchtimeUrl?.copy(
-                                            baseUrl =
-                                                playbackTracking.videostatsWatchtimeUrl.baseUrl
-                                                    ?.toKmpUri()
-                                                    ?.buildUpon()
-                                                    ?.apply {
-                                                        if (fexp != null) {
-                                                            appendQueryParameter("fexp", fexp)
-                                                        }
-                                                    }?.build()
-                                                    ?.toString(),
-                                        ),
-                                ),
-                        )
+                                                    ?.getQueryParameter("fexp")
+                                            val playbackTracking = it.playbackTracking
+                                            it.copy(
+                                                playbackTracking =
+                                                    playbackTracking?.copy(
+                                                        atrUrl =
+                                                            playbackTracking.atrUrl?.copy(
+                                                                baseUrl =
+                                                                    playbackTracking.atrUrl.baseUrl
+                                                                        ?.toKmpUri()
+                                                                        ?.buildUpon()
+                                                                        ?.apply {
+                                                                            if (fexp != null) {
+                                                                                appendQueryParameter("fexp", fexp)
+                                                                            }
+                                                                        }?.build()
+                                                                        ?.toString(),
+                                                            ),
+                                                        videostatsPlaybackUrl =
+                                                            playbackTracking.videostatsPlaybackUrl?.copy(
+                                                                baseUrl =
+                                                                    playbackTracking.videostatsPlaybackUrl.baseUrl
+                                                                        ?.toKmpUri()
+                                                                        ?.buildUpon()
+                                                                        ?.apply {
+                                                                            if (fexp != null) {
+                                                                                appendQueryParameter("fexp", fexp)
+                                                                            }
+                                                                        }?.build()
+                                                                        ?.toString(),
+                                                            ),
+                                                        videostatsWatchtimeUrl =
+                                                            playbackTracking.videostatsWatchtimeUrl?.copy(
+                                                                baseUrl =
+                                                                    playbackTracking.videostatsWatchtimeUrl.baseUrl
+                                                                        ?.toKmpUri()
+                                                                        ?.buildUpon()
+                                                                        ?.apply {
+                                                                            if (fexp != null) {
+                                                                                appendQueryParameter("fexp", fexp)
+                                                                            }
+                                                                        }?.build()
+                                                                        ?.toString(),
+                                                            ),
+                                                    ),
+                                            )
+                                        }
+                                }
+                            }.getOrNull()
+                        }
+                    val raced = racedDeferred.await()
+                    // Zero-wait fast path: once a playable stream winner arrives with videoDetails, do not
+                    // block playback on a slow WEB_REMIX call — give WEB_REMIX at most 120ms if still running.
+                    val webWaitMs = if (raced != null && raced.videoDetails != null) 120L else 1800L
+                    val webRemixRes =
+                        kotlinx.coroutines.withTimeoutOrNull(webWaitMs) { webRemixDeferred.await() }
+                            .also { webRemixDeferred.cancel() }
+                    if (webRemixRes?.videoDetails?.isLive == true || raced?.videoDetails?.isLive == true) {
+                        val liveBase =
+                            webRemixRes
+                                ?: PlayerResponse(
+                                    responseContext = com.maxrave.kotlinytmusicscraper.models.ResponseContext(null, null, null),
+                                    playabilityStatus = PlayerResponse.PlayabilityStatus(status = "OK", reason = null),
+                                    playerConfig = null,
+                                    streamingData = null,
+                                    videoDetails = raced?.videoDetails,
+                                    playbackTracking = null,
+                                    captions = null,
+                                )
+                        liveBase to null
+                    } else {
+                        val baseRes =
+                            webRemixRes
+                                ?: PlayerResponse(
+                                    responseContext = com.maxrave.kotlinytmusicscraper.models.ResponseContext(null, null, null),
+                                    playabilityStatus = PlayerResponse.PlayabilityStatus(status = "UNPLAYABLE", reason = null),
+                                    playerConfig = null,
+                                    streamingData = null,
+                                    videoDetails = raced?.videoDetails,
+                                    playbackTracking = null,
+                                    captions = null,
+                                )
+                        val hydratedRes =
+                            if (baseRes.videoDetails == null && raced?.videoDetails != null) {
+                                baseRes.copy(videoDetails = raced.videoDetails)
+                            } else {
+                                baseRes
+                            }
+                        hydratedRes to raced?.streams
                     }
+                }
 
             // A live broadcast has no fixed-length formats to decode: it plays from one HLS
             // playlist. videoDetails is present even on a response this client was refused, so the
@@ -1643,7 +1833,7 @@ class YouTube {
                 return@runCatching Triple(cpn, tempRes.asLiveStream(liveHlsUrl), MediaType.Video)
             }
 
-            val response = newPipePlayer(videoId, tempRes, preferredAudioLanguage)
+            val response = newPipePlayer(videoId, tempRes, preferredAudioLanguage, preFetchedStreams)
             if (response != null) {
                 decodedSigResponse = response
                 Logger.d(TAG, "YouTube Player found URL")
@@ -2417,4 +2607,224 @@ class YouTube {
         const val DEFAULT_VISITOR_DATA = "CgtsZG1ySnZiQWtSbyiMjuGSBg%3D%3D"
 
     }
+}
+
+private fun isManifestStreamUrl(url: String): Boolean =
+    url.contains(".m3u8") || url.contains(".mpd") || url.contains("manifest")
+
+fun inferStreamItag(
+    rawItag: Int,
+    isAudio: Boolean,
+    mimeType: String,
+    codec: String,
+): Int {
+    if (rawItag > 0) return rawItag
+    return if (isAudio) {
+        if (mimeType.contains("webm", ignoreCase = true) || codec.contains("opus", ignoreCase = true)) {
+            251
+        } else {
+            140
+        }
+    } else {
+        ITAG.VIDEO_720P
+    }
+}
+
+/**
+ * Races [racers] concurrently and returns the VERY FIRST non-null result, immediately cancelling
+ * all remaining slower racers. If fast racers return null or throw, keeps waiting for the rest.
+ */
+suspend fun <T : Any> raceFirstNonNull(
+    racers: List<suspend () -> T?>,
+): T? {
+    if (racers.isEmpty()) return null
+    return coroutineScope {
+        val channel = kotlinx.coroutines.channels.Channel<T?>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val jobs =
+            racers.map { racer ->
+                async(Dispatchers.Default) {
+                    val value =
+                        try {
+                            racer()
+                        } catch (c: kotlinx.coroutines.CancellationException) {
+                            throw c
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    channel.trySend(value)
+                }
+            }
+        var winner: T? = null
+        try {
+            for (i in racers.indices) {
+                val next = channel.receive()
+                if (next != null) {
+                    winner = next
+                    break
+                }
+            }
+        } finally {
+            jobs.forEach { it.cancel() }
+            channel.close()
+        }
+        winner
+    }
+}
+
+fun mergeNewPipeStreams(
+    sigResponse: PlayerResponse,
+    streamsList: List<Pair<Int, String>>,
+): PlayerResponse {
+    val streamingData =
+        sigResponse.streamingData
+            ?: PlayerResponse.StreamingData(
+                formats = emptyList(),
+                adaptiveFormats = emptyList(),
+                expiresInSeconds = 21540,
+                hlsManifestUrl = null,
+            )
+    val mappedFormats =
+        streamingData.formats?.map { format ->
+            val url = streamsList.find { it.first == format.itag }?.second
+            format.copy(
+                url = url,
+                contentLength = url?.let(::contentLengthOf) ?: format.contentLength,
+            )
+        }
+    val mappedAdaptive =
+        streamingData.adaptiveFormats.map { adaptiveFormat ->
+            val url = streamsList.find { it.first == adaptiveFormat.itag }?.second
+            adaptiveFormat.copy(
+                url = url,
+                contentLength = url?.let(::contentLengthOf) ?: adaptiveFormat.contentLength,
+            )
+        }
+    val existingAdaptiveItags =
+        mappedAdaptive
+            .filter { !it.url.isNullOrEmpty() }
+            .mapTo(mutableSetOf()) { it.itag }
+    val appendedAdaptive = mutableListOf<PlayerResponse.StreamingData.Format>()
+    for ((itag, url) in streamsList) {
+        if (url.isBlank() || isManifestStreamUrl(url)) continue
+        if (itag !in ITAG.AUDIO && itag !in ITAG.VIDEO) continue
+        if (!existingAdaptiveItags.add(itag)) continue
+        appendedAdaptive.add(synthesizeNewPipeFormat(itag, url))
+    }
+    val finalFormats =
+        mappedFormats?.let { formats ->
+            val copy = formats.toMutableList()
+            streamsList
+                .filter { isManifestStreamUrl(it.second) }
+                .forEach { manifest ->
+                    copy.add(
+                        PlayerResponse.StreamingData.Format(
+                            itag = manifest.first,
+                            url = manifest.second,
+                            mimeType = "",
+                            bitrate = 0,
+                            width = if (manifest.first == 96) 1920 else 1080,
+                            height = if (manifest.first == 96) 1080 else 720,
+                            contentLength = 0,
+                            quality = "",
+                            fps = 0,
+                            qualityLabel = "",
+                            averageBitrate = 0,
+                            audioQuality = "",
+                            approxDurationMs = "",
+                            audioSampleRate = 0,
+                            audioChannels = 0,
+                            loudnessDb = 0.0,
+                            lastModified = 0,
+                            signatureCipher = "",
+                        ),
+                    )
+                }
+            copy.filter { it.itag != 0 }
+        }
+    val mergedAdaptive = mappedAdaptive + appendedAdaptive
+    val hasAnyPlayableUrl =
+        mergedAdaptive.any { !it.url.isNullOrEmpty() } ||
+            finalFormats?.any { !it.url.isNullOrEmpty() } == true ||
+            streamsList.any { it.first == 96 && it.second.isNotBlank() }
+    return sigResponse.copy(
+        playabilityStatus =
+            if (hasAnyPlayableUrl && sigResponse.playabilityStatus.status != "OK") {
+                sigResponse.playabilityStatus.copy(status = "OK", reason = null)
+            } else {
+                sigResponse.playabilityStatus
+            },
+        streamingData =
+            streamingData.copy(
+                formats = finalFormats,
+                adaptiveFormats = mergedAdaptive,
+                expiresInSeconds = streamingData.expiresInSeconds.takeIf { it > 0 } ?: 21540,
+                hlsManifestUrl = streamsList.firstOrNull { it.first == 96 }?.second,
+            ),
+    )
+}
+
+private fun synthesizeNewPipeFormat(
+    itag: Int,
+    url: String,
+): PlayerResponse.StreamingData.Format {
+    val isAudio = itag in ITAG.AUDIO
+    val mimeFromUrl =
+        runCatching { url.toKmpUri().getQueryParameter("mime") }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+    val isAac = itag == ITAG.AUDIO_AAC_HIGH || itag == ITAG.AUDIO_AAC_MEDIUM
+    val codecs =
+        when (itag) {
+            ITAG.AUDIO_AAC_HIGH, ITAG.AUDIO_AAC_MEDIUM -> "mp4a.40.2"
+            in ITAG.AUDIO -> "opus"
+            in ITAG.VIDEO -> "avc1.640028"
+            else -> null
+        }
+    val mimeType =
+        when {
+            mimeFromUrl != null && codecs != null && !mimeFromUrl.contains("codecs") ->
+                "$mimeFromUrl; codecs=\"$codecs\""
+            mimeFromUrl != null -> mimeFromUrl
+            isAac -> "audio/mp4; codecs=\"mp4a.40.2\""
+            isAudio -> "audio/webm; codecs=\"opus\""
+            else -> "video/mp4; codecs=\"avc1.640028\""
+        }
+    val bitrate =
+        when (itag) {
+            ITAG.AUDIO_OPUS_LOW -> 66000
+            ITAG.AUDIO_AAC_MEDIUM -> 128000
+            ITAG.AUDIO_OPUS_MEDIUM -> 129000
+            ITAG.AUDIO_OPUS_HIGH, ITAG.AUDIO_AAC_HIGH -> 256000
+            ITAG.VIDEO_360P -> 500000
+            ITAG.VIDEO_720P -> 1500000
+            ITAG.VIDEO_1080P -> 3000000
+            else -> 0
+        }
+    val (width, height) =
+        when (itag) {
+            ITAG.VIDEO_360P -> 640 to 360
+            ITAG.VIDEO_720P -> 1280 to 720
+            ITAG.VIDEO_1080P -> 1920 to 1080
+            else -> null to null
+        }
+    return PlayerResponse.StreamingData.Format(
+        itag = itag,
+        url = url,
+        mimeType = mimeType,
+        bitrate = bitrate,
+        width = width,
+        height = height,
+        contentLength = contentLengthOf(url),
+        quality = "",
+        fps = if (isAudio) null else 30,
+        qualityLabel = if (isAudio) null else "${height}p",
+        averageBitrate = bitrate,
+        audioQuality = if (isAudio) "AUDIO_QUALITY_MEDIUM" else null,
+        approxDurationMs = null,
+        audioSampleRate = if (isAudio) (if (isAac) 44100 else 48000) else null,
+        audioChannels = if (isAudio) 2 else null,
+        loudnessDb = null,
+        lastModified = null,
+        signatureCipher = null,
+    )
 }

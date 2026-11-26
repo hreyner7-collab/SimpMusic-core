@@ -20,7 +20,10 @@ import org.simpmusic.lyrics.models.response.LrclibObject
 import org.simpmusic.lyrics.models.response.LyricsResponse
 import org.simpmusic.lyrics.models.response.TranslatedLyricsResponse
 import org.simpmusic.lyrics.parser.parseLrclibLyrics
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.abs
+import kotlin.time.Clock
+import kotlin.time.ExperimentalTime
 
 private const val TAG = "SimpMusicLyricsClient"
 
@@ -41,12 +44,31 @@ class SimpMusicLyricsClient {
 
     private var tooManyRequest: Boolean = false
 
+    @kotlin.concurrent.Volatile
+    private var rateLimitedUntilMs: Long = 0L
+
+    @kotlin.concurrent.Volatile
+    private var consecutive429Count: Int = 0
+
     private var insertingTranslatedLyrics: Pair<String?, Boolean> = (null to false)
     private val isInsertingTranslatedLyrics: Boolean
         get() = insertingTranslatedLyrics.second
 
+    @OptIn(ExperimentalTime::class)
+    private fun checkRateLimit() {
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        if (nowMs < rateLimitedUntilMs) {
+            val remainingSec = (rateLimitedUntilMs - nowMs + 999L) / 1000L
+            throw SimpMusicLyricsApiException(
+                429,
+                "Rate limited; cooling down for ${remainingSec}s",
+            )
+        }
+    }
+
     suspend fun getLyrics(videoId: String): Result<List<LyricsResponse>> =
         runCatching {
+            checkRateLimit()
             lyricsService.findLyricsByVideoId(videoId).bodyOrThrow<List<LyricsResponse>>()
         }
 
@@ -55,6 +77,7 @@ class SimpMusicLyricsClient {
         language: String,
     ): Result<TranslatedLyricsResponse> =
         runCatching {
+            checkRateLimit()
             if (language.length != 2) {
                 throw IllegalArgumentException("Language code must be a 2-letter code")
             }
@@ -63,22 +86,25 @@ class SimpMusicLyricsClient {
 
     suspend fun insertLyrics(lyricsBody: LyricsBody): Result<LyricsResponse> =
         runCatching {
-            if (tooManyRequest) {
-                throw IllegalStateException("Too many requests, please wait before trying again.")
-            }
+            checkRateLimit()
             if (isInsertingLyrics && insertingLyrics.first == lyricsBody.videoId) {
                 throw IllegalStateException("Already inserting lyrics, please wait until the current operation is complete.")
             }
             insertingLyrics = lyricsBody.videoId to true
-            val hmacTimestamp =
-                hmacService.getMacTimestampPair(
-                    HmacUri.BASE_HMAC_URI,
-                )
-            lyricsService.insertLyrics(lyricsBody, hmacTimestamp).bodyOrThrow<LyricsResponse>()
+            try {
+                val hmacTimestamp =
+                    hmacService.getMacTimestampPair(
+                        HmacUri.BASE_HMAC_URI,
+                    )
+                lyricsService.insertLyrics(lyricsBody, hmacTimestamp).bodyOrThrow<LyricsResponse>()
+            } finally {
+                insertingLyrics = null to false
+            }
         }
 
     suspend fun insertTranslatedLyrics(translatedLyricsBody: TranslatedLyricsBody): Result<TranslatedLyricsResponse> =
         runCatching {
+            checkRateLimit()
             if (translatedLyricsBody.language.length != 2) {
                 throw IllegalArgumentException("Language code must be a 2-letter code")
             }
@@ -86,11 +112,15 @@ class SimpMusicLyricsClient {
                 throw IllegalStateException("Already inserting translated lyrics, please wait until the current operation is complete.")
             }
             insertingTranslatedLyrics = translatedLyricsBody.videoId to true
-            val hmacTimestamp =
-                hmacService.getMacTimestampPair(
-                    HmacUri.TRANSLATED_HMAC_URI,
-                )
-            lyricsService.insertTranslatedLyrics(translatedLyricsBody, hmacTimestamp).bodyOrThrow<TranslatedLyricsResponse>()
+            try {
+                val hmacTimestamp =
+                    hmacService.getMacTimestampPair(
+                        HmacUri.TRANSLATED_HMAC_URI,
+                    )
+                lyricsService.insertTranslatedLyrics(translatedLyricsBody, hmacTimestamp).bodyOrThrow<TranslatedLyricsResponse>()
+            } finally {
+                insertingTranslatedLyrics = null to false
+            }
         }
 
     suspend fun voteLyrics(
@@ -98,6 +128,7 @@ class SimpMusicLyricsClient {
         upvote: Boolean,
     ): Result<LyricsResponse> =
         runCatching {
+            checkRateLimit()
             val hmacTimestamp =
                 hmacService.getMacTimestampPair(
                     HmacUri.VOTE_HMAC_URI,
@@ -110,6 +141,7 @@ class SimpMusicLyricsClient {
         upvote: Boolean,
     ): Result<TranslatedLyricsResponse> =
         runCatching {
+            checkRateLimit()
             val hmacTimestamp =
                 hmacService.getMacTimestampPair(
                     HmacUri.VOTE_TRANSLATED_HMAC_URI,
@@ -273,12 +305,22 @@ class SimpMusicLyricsClient {
                 ?.uri
         }
 
+    @OptIn(ExperimentalTime::class)
     private suspend inline fun <reified T> HttpResponse.bodyOrThrow(): T {
+        val nowMs = Clock.System.now().toEpochMilliseconds()
         if (this.status.value == 429) {
             tooManyRequest = true
-            Logger.e(TAG, "Too many requests: ${this.status.value}")
+            val retryAfterMs = this.headers["Retry-After"]?.toLongOrNull()?.times(1000L)
+            val backoffMs =
+                retryAfterMs ?: minOf(60_000L * (1L shl consecutive429Count.coerceAtMost(4)), 900_000L)
+            consecutive429Count++
+            rateLimitedUntilMs = nowMs + backoffMs
+            Logger.w(TAG, "Rate limited (429), pausing SimpMusic Lyrics requests for ${backoffMs / 1000}s")
+            throw SimpMusicLyricsApiException(429, "Too many requests, please try again later (code: 429)")
         } else {
             tooManyRequest = false
+            consecutive429Count = 0
+            rateLimitedUntilMs = 0L
         }
         try {
             val data = body<BaseResponse<T>>()
@@ -290,6 +332,8 @@ class SimpMusicLyricsClient {
                 throw SimpMusicLyricsApiException(error.code, message)
             }
             return data.data ?: throw Exception("Response data is null")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             throw e
         }

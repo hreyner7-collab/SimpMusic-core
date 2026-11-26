@@ -9,9 +9,14 @@ import dev.maxrave.pipepipe.extractor.exceptions.ParsingException
 import dev.maxrave.pipepipe.extractor.services.youtube.YoutubeApiDecoder
 import dev.maxrave.pipepipe.extractor.services.youtube.YoutubeJavaScriptDecoder
 import io.ktor.client.HttpClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "FaradayJsDecoder"
 private const val JS_THREAD_STACK_BYTES = 32L * 1024L * 1024L
@@ -59,6 +64,26 @@ internal class FaradayJsDecoder : YoutubeJavaScriptDecoder {
             .asCoroutineDispatcher()
 
     private val engine by lazy { FaradayCipherEngine(HttpClient(getEngine()), jsThread, bridgedLogger) }
+    private val warmUpScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val warmUpStarted = AtomicBoolean(false)
+
+    @Volatile
+    private var verifiedSolverKey: String? = null
+
+    fun warmUp() {
+        if (warmUpStarted.compareAndSet(false, true)) {
+            warmUpScope.launch { runCatching { engine.warmUp() } }
+        }
+    }
+
+    fun isCurrentSolverVerified(): Boolean {
+        val key = engine.activeSolverKey() ?: return false
+        return verifiedSolverKey == key
+    }
+
+    fun markCurrentSolverVerified() {
+        engine.activeSolverKey()?.let { verifiedSolverKey = it }
+    }
 
     override fun getPlayerData(videoId: String): YoutubeJavaScriptDecoder.PlayerData {
         val info =
@@ -96,7 +121,10 @@ internal class FaradayJsDecoder : YoutubeJavaScriptDecoder {
     }
 
     /** Discard the cached player table and solver after the CDN rejected a URL we deciphered. */
-    fun invalidate() = runBlocking { engine.invalidate() }
+    fun invalidate() {
+        verifiedSolverKey = null
+        runBlocking { engine.invalidate() }
+    }
 
     private val bridgedLogger =
         InnerTubeLogger { event ->

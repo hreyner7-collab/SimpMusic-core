@@ -3,6 +3,7 @@ package com.maxrave.domain.data.entities
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import com.maxrave.common.ITAG
 import com.maxrave.domain.extension.now
 import kotlinx.datetime.LocalDateTime
 
@@ -33,3 +34,6 @@ data class NewFormatEntity(
     @ColumnInfo(defaultValue = "NULL")
     val keyScale: String? = null,
 )
+
+fun NewFormatEntity.matchesAudioItag(targetItag: Int): Boolean =
+    itag == targetItag || itag == ITAG.highQualityTwinOf(targetItag)

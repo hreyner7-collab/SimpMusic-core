@@ -339,6 +339,55 @@ interface DataStoreManager {
 
     val spotifyPersonalTokenExpires: Flow<Long>
 
+    /** DJ commentary: when off the DJ plays music without talking. */
+    val djCommentary: Flow<String>
+
+    suspend fun setDjCommentary(enabled: Boolean)
+
+    /** Which voice the DJ uses: "NATURAL" (the offline neural voice) or "SYSTEM" (the OS voice). */
+    val djVoice: Flow<String>
+
+    suspend fun setDjVoice(voice: String)
+
+    /** AI DJ switch. */
+    val djEnabled: Flow<String>
+
+    suspend fun setDjEnabled(enabled: Boolean)
+
+    /** The DJ speaks before every Nth song. */
+    val djEvery: Flow<Int>
+
+    suspend fun setDjEvery(every: Int)
+
+    /** Stereo widener switch; the amount below outlives the switch. */
+    val stereoWidenEnabled: Flow<String>
+
+    suspend fun setStereoWidenEnabled(enabled: Boolean)
+
+    /** Widener amount, `0f..1f`; [com.maxrave.domain.data.player.StereoWidener] turns it into a width factor. */
+    val stereoWidenAmount: Flow<Float>
+
+    suspend fun setStereoWidenAmount(amount: Float)
+
+    /** Client ID of the user's own Spotify developer app; empty when none is set. */
+    val spotifyOAuthClientId: Flow<String>
+
+    suspend fun setSpotifyOAuthClientId(clientId: String)
+
+    /** Refresh token of the signed-in own-app session; empty when signed out. */
+    val spotifyOAuthRefreshToken: Flow<String>
+
+    suspend fun setSpotifyOAuthRefreshToken(token: String)
+
+    val spotifyOAuthAccessToken: Flow<String>
+
+    suspend fun setSpotifyOAuthAccessToken(token: String)
+
+    /** Epoch milliseconds at which [spotifyOAuthAccessToken] stops being valid. */
+    val spotifyOAuthExpiresAt: Flow<Long>
+
+    suspend fun setSpotifyOAuthExpiresAt(expiresAtMs: Long)
+
     suspend fun setSpotifyPersonalTokenExpires(expires: Long)
 
     val homeLimit: Flow<Int>
