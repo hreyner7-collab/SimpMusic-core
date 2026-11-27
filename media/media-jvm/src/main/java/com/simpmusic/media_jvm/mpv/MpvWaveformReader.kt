@@ -127,11 +127,22 @@ internal object MpvWaveformReader {
             }
             progress.publish(mediaId, bars)
             File(dir, "$name.wf").writeBytes(ByteArray(bars.size) { (bars[it] * 255f).toInt().coerceIn(0, 255).toByte() })
-            val structure =
+            val pcmSamples =
                 pcm
                     .takeIf { it.isFile && it.length() in 2..MAX_ANALYSIS_BYTES }
+                    ?.let { runCatching { readPcm(it) }.getOrNull() }
+            if (pcmSamples != null) {
+                runCatching {
+                    val spec = DesktopSpectrumAnalyzer.computeSpectrumFrames(pcmSamples, SAMPLE_RATE, WAVEFORM_BARS_PER_SECOND)
+                    if (spec.isNotEmpty()) {
+                        File(dir, "$name.spec").writeBytes(ByteArray(spec.size) { (spec[it] * 255f).toInt().coerceIn(0, 255).toByte() })
+                    }
+                }
+            }
+            val structure =
+                pcmSamples
                     // Kept apart from the waveform: a failure here must not cost the bars already measured.
-                    ?.let { runCatching { TrackStructureAnalyzer.analyze(readPcm(it)) }.getOrNull() }
+                    ?.let { runCatching { TrackStructureAnalyzer.analyze(it) }.getOrNull() }
             // Written even when empty, so a track found unusable is not decoded again for AutoMix.
             File(dir, "$name.mix").writeText(structure?.encode().orEmpty())
             Logger.d(

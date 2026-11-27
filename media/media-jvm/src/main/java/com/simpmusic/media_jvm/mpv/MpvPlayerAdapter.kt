@@ -1514,6 +1514,9 @@ class MpvPlayerAdapter internal constructor(
     @Volatile
     private var cachedVisualizerWaveform: FloatArray? = null
 
+    @Volatile
+    private var cachedVisualizerSpectrum: FloatArray? = null
+
     private var visualizerWaveformLookupJob: Job? = null
 
     /**
@@ -3411,11 +3414,14 @@ class MpvPlayerAdapter internal constructor(
         if (mediaId != null && mediaId != cachedVisualizerMediaId) {
             cachedVisualizerMediaId = mediaId
             cachedVisualizerWaveform = null
+            cachedVisualizerSpectrum = null
             visualizerWaveformLookupJob?.cancel()
             visualizerWaveformLookupJob =
                 coroutineScope.launch(Dispatchers.IO) {
                     val safeName = mediaId.replace(Regex("[^A-Za-z0-9_-]"), "_")
-                    val wfFile = File(System.getProperty("user.home"), ".simpmusic${File.separator}waveforms${File.separator}$safeName.wf")
+                    val wfDir = File(System.getProperty("user.home"), ".simpmusic${File.separator}waveforms")
+                    val wfFile = File(wfDir, "$safeName.wf")
+                    val specFile = File(wfDir, "$safeName.spec")
                     val bars =
                         if (wfFile.isFile && wfFile.length() in 1L..2_000_000L) {
                             runCatching {
@@ -3425,8 +3431,27 @@ class MpvPlayerAdapter internal constructor(
                         } else {
                             null
                         }
+                    val spec =
+                        if (specFile.isFile && specFile.length() in 4L..8_000_000L) {
+                            runCatching {
+                                val bytes = specFile.readBytes()
+                                FloatArray(bytes.size) { (bytes[it].toInt() and 0xFF) / 255f }
+                            }.getOrNull()
+                        } else {
+                            null
+                        }
                     if (cachedVisualizerMediaId == mediaId) {
                         cachedVisualizerWaveform = bars
+                        cachedVisualizerSpectrum = spec
+                    }
+                    if (spec == null && !LiveStreamRegistry.isLive(mediaId)) {
+                        runCatching {
+                            MpvWaveformReader.read(mediaId, {}) { waveformSourceUrl(mediaId) }
+                            if (specFile.isFile && specFile.length() in 4L..8_000_000L && cachedVisualizerMediaId == mediaId) {
+                                val bytes = specFile.readBytes()
+                                cachedVisualizerSpectrum = FloatArray(bytes.size) { (bytes[it].toInt() and 0xFF) / 255f }
+                            }
+                        }
                     }
                 }
         }
@@ -3451,11 +3476,36 @@ class MpvPlayerAdapter internal constructor(
                 phrase.toFloat().coerceIn(0.22f, 0.96f)
             }
 
+        val spec = cachedVisualizerSpectrum
+        val count = AudioVisualizerBus.BAND_COUNT
+        if (spec != null && spec.size >= DesktopSpectrumAnalyzer.BANDS_PER_FRAME) {
+            val frameCount = spec.size / DesktopSpectrumAnalyzer.BANDS_PER_FRAME
+            val frameIdx = ((positionMs.coerceAtLeast(0L) / 1000.0) * WAVEFORM_BARS_PER_SECOND).toInt().coerceIn(0, frameCount - 1)
+            val base = frameIdx * DesktopSpectrumAnalyzer.BANDS_PER_FRAME
+            val bass = spec[base]
+            val lowMid = spec[base + 1]
+            val vocalMid = spec[base + 2]
+            val highPitch = spec[base + 3]
+            val karaoke = internalKaraokeEffect
+            val karaokeDip = if (karaoke.isActive) karaoke.clampedSuppression * 0.45f else 0f
+            for (i in 0 until count) {
+                val bandEnergy =
+                    when {
+                        i <= 4 -> bass
+                        i <= 9 -> lowMid
+                        i <= 15 -> vocalMid * (1f - karaokeDip)
+                        else -> highPitch
+                    }
+                desktopSpectrumScratch[i] = (bandEnergy * gain).coerceIn(0f, 1f)
+            }
+            AudioVisualizerBus.publishRawSpectrum(desktopSpectrumScratch)
+            return
+        }
+
         val seed = ((mediaId?.hashCode() ?: 0) and 0xFFFF) * 0.013
         val karaoke = internalKaraokeEffect
         val karaokeDip = if (karaoke.isActive) karaoke.clampedSuppression * 0.45f else 0f
 
-        val count = AudioVisualizerBus.BAND_COUNT
         for (i in 0 until count) {
             val normPos = i.toFloat() / (count - 1)
             // Musical pink-spectrum tilt: fuller bass/low-mids, crisp dancing highs.
