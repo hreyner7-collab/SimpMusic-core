@@ -25,6 +25,16 @@ actual fun createDataStoreInstance(): DataStore<Preferences> =
             ),
     )
 
+actual fun createPlaybackStateDataStoreInstance(): DataStore<Preferences> =
+    PreferenceDataStoreFactory.create(
+        storage =
+            ReadsWaitForWritesStorage(
+                FileStorage(PreferencesFileSerializer) {
+                    File(getHomeFolderPath(listOf(".simpmusic")), "playback_state.preferences_pb").absoluteFile
+                },
+            ),
+    )
+
 /**
  * Makes a disk read of the settings file wait while a save is replacing it. Without this, Windows
  * users crash with "Unable to rename settings.preferences_pb.tmp" (#2357, #2400, #2521 and others).

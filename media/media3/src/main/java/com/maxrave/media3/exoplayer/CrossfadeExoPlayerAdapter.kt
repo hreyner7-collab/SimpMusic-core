@@ -29,6 +29,7 @@ import com.maxrave.domain.data.player.EightDOrbit
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.mediaservice.automix.TrackStructure
 import com.maxrave.domain.mediaservice.automix.TransitionPlan
@@ -37,6 +38,7 @@ import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.extension.isVideo
 import com.maxrave.domain.manager.DataStoreManager
+import com.maxrave.domain.mediaservice.player.AudioVisualizerBus
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.StreamRepository
@@ -50,7 +52,9 @@ import com.maxrave.media3.audio.StereoWidenerAudioProcessor
 import com.maxrave.media3.audio.EightDAudioProcessor
 import com.maxrave.media3.audio.EqualizerAudioProcessor
 import com.maxrave.media3.audio.EqualizerCurve
+import com.maxrave.media3.audio.KaraokeAudioProcessor
 import com.maxrave.media3.audio.SleepFadeAudioProcessor
+import com.maxrave.media3.audio.VisualizerAudioProcessor
 import com.maxrave.media3.service.mediasourcefactory.isLiveStreamDetected
 import com.maxrave.media3.exoplayer.CrossfadeExoPlayerAdapter.Companion.SPEED_PITCH_STEP
 import com.maxrave.media3.service.mediasourcefactory.MergingMediaSourceFactory
@@ -240,6 +244,9 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
      */
     @Volatile
     private var internalAudioEffects: AudioEffects = AudioEffects.NONE
+
+    @Volatile
+    private var internalKaraokeEffect: KaraokeEffect = KaraokeEffect.OFF
 
     private val eightDOrbit = EightDOrbit()
     override val eightDAvailable: StateFlow<Boolean> = MutableStateFlow(true)
@@ -659,10 +666,19 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
         val crossfadeFilter = CrossfadeFilterAudioProcessor()
         val sleepFade = SleepFadeAudioProcessor { internalSleepFadeFactor }
         val equalizer = EqualizerAudioProcessor { internalEqualizerCurve }
+        val karaoke = KaraokeAudioProcessor { internalKaraokeEffect }
         val echo = EchoAudioProcessor { internalAudioEffects }
         val reverb = ConvolutionReverbAudioProcessor { internalAudioEffects }
         val widen = StereoWidenerAudioProcessor { internalAudioEffects }
         val eightD = EightDAudioProcessor(eightDOrbit)
+        var ownerPlayer: ExoPlayer? = null
+        val visualizer =
+            VisualizerAudioProcessor(
+                isSourceActive = {
+                    internalState == InternalState.PLAYING &&
+                        (ownerPlayer === currentPlayer || (isCrossfading && ownerPlayer === secondaryPlayer))
+                },
+            )
 
         val perPlayerRenderers =
             object : DefaultRenderersFactory(appContext) {
@@ -680,14 +696,12 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
                                 // Equalizer first, matching the desktop graph, where the ten
                                 // `equalizer` entries sit ahead of everything else in mpv's `af`
                                 // list — it decides which stage a boost can clip in, and the
-                                // preamp that makes room for the boost belongs with it. Then the
-                                // two effects, and only then the crossfade filter: an echo tail
-                                // and a reverb tail belong to the track that caused them, so the
-                                // crossfade has to be able to sweep them out along with it rather
-                                // than the other way round. The sleep fade is the master
-                                // attenuation; only the 8D pan, a gain matrix it commutes with,
-                                // comes after it (see below).
-                                arrayOf(equalizer, echo, reverb, widen, crossfadeFilter, sleepFade),
+                                // preamp that makes room for the boost belongs with it. Karaoke
+                                // runs before echo/reverb/widen so centered vocals are cancelled
+                                // before spatial effects spread them. Then the crossfade filter
+                                // sweeps the tails, and sleep fade is the master attenuation; only
+                                // the 8D pan and pass-through visualizer tap come after Sonic.
+                                arrayOf(equalizer, karaoke, echo, reverb, widen, crossfadeFilter, sleepFade),
                                 SilenceSkippingAudioProcessor(
                                     2_000_000,
                                     (20_000 / 2_000_000).toFloat(),
@@ -702,7 +716,7 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
                                 // duration even when playback speed or DJ tempo changes.
                                 // DefaultAudioSink builds its pipeline from getAudioProcessors()
                                 // (media3 1.11.1 DefaultAudioSink.java:759).
-                                private val processorsWithEightD = super.getAudioProcessors() + eightD
+                                private val processorsWithEightD = super.getAudioProcessors() + eightD + visualizer
 
                                 override fun getAudioProcessors(): Array<AudioProcessor> = processorsWithEightD
                             },
@@ -729,6 +743,7 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
                 .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
                 .setRenderersFactory(perPlayerRenderers)
                 .build()
+        ownerPlayer = player
 
         // The output the user picked, if any: a player built for the next track, a crossfade or a
         // precache starts where the others are playing rather than back on the system's choice.
@@ -1730,6 +1745,10 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
         eightDOrbit.setEffect(effect)
     }
 
+    override fun setKaraokeEffect(effect: KaraokeEffect) {
+        internalKaraokeEffect = effect.clamped()
+    }
+
     override var skipSilenceEnabled: Boolean
         get() = internalSkipSilence
         set(value) {
@@ -1753,6 +1772,7 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
 
     override fun release() {
         eightDOrbit.setPlaying(false)
+        AudioVisualizerBus.reset()
         // Cancel all ongoing jobs
         loadSeq.incrementAndGet()
         currentLoadJob?.cancel()
@@ -1805,6 +1825,9 @@ internal class CrossfadeExoPlayerAdapter internal constructor(
         val oldState = internalState
         internalState = newState
         eightDOrbit.setPlaying(newState == InternalState.PLAYING)
+        if (newState != InternalState.PLAYING) {
+            AudioVisualizerBus.reset()
+        }
 
         Logger.d(TAG, "State: $oldState -> $newState (playWhenReady=$internalPlayWhenReady)")
 

@@ -4,6 +4,7 @@ import com.maxrave.domain.data.player.DelayTaps
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDHead
 import com.maxrave.domain.data.player.EightDOrbit
+import com.maxrave.domain.data.player.KaraokeEffect
 
 internal enum class EightDTransition { ACTIVE, FADE_IN, FADE_OUT }
 
@@ -62,6 +63,36 @@ internal fun eightDGraph(
 
 /** `af_aecho.c:139` — *"delay[%d]: %f is out of allowed range: (0, 90000]"*. */
 private const val AECHO_MAX_DELAY_MS = 90_000
+
+/**
+ * Lowest `mlev` accepted by ffmpeg's `stereotools` (`af_stereotools.c`: `[0.015625, 64]`, ~-36 dB).
+ * Pinned to `0.0157f` so `mpvNumber` (`%.4f`) never rounds below `0.015625`.
+ */
+private const val STEREOTOOLS_MIN_MLEV = 0.0157f
+
+/**
+ * The lavfi graph body for [KaraokeEffect], or null when karaoke is disabled or suppression is 0.
+ *
+ * When [KaraokeEffect.preserveBass] is true, splits stereo audio into complementary 1-pole
+ * low-pass (< 180 Hz) and high-pass (> 180 Hz) bands — whose sum is exact unity all-pass — applies
+ * center attenuation (`stereotools=mlev=<1-s>:slev=1`) only on the vocal band, then sums both back
+ * cleanly at unity without `amix` normalization.
+ */
+internal fun karaokeGraph(effect: KaraokeEffect): String? {
+    val clamped = effect.clamped()
+    if (!clamped.isActive) return null
+    val mlev = (1f - clamped.vocalSuppression).coerceIn(STEREOTOOLS_MIN_MLEV, 1f)
+    val mlevFormatted = mpvNumber(mlev)
+    val cutoffHz = KaraokeEffect.BASS_CUTOFF_HZ.toInt()
+    return if (clamped.preserveBass) {
+        "asplit[kl][kh];" +
+            "[kl]lowpass=f=$cutoffHz:p=1[kbass];" +
+            "[kh]highpass=f=$cutoffHz:p=1,stereotools=mlev=$mlevFormatted:slev=1[kvox];" +
+            "[kbass][kvox]amix=inputs=2:weights=1 1:normalize=0"
+    } else {
+        "stereotools=mlev=$mlevFormatted:slev=1"
+    }
+}
 
 /**
  * Render an echo coefficient so it parses back to the SAME `Float` mpv was handed.

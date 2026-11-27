@@ -31,6 +31,7 @@ import com.maxrave.logger.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
@@ -39,6 +40,7 @@ import com.maxrave.common.QUALITY as COMMON_QUALITY
 
 internal class DataStoreManagerImpl(
     private val settingsDataStore: DataStore<Preferences>,
+    private val playbackStateDataStore: DataStore<Preferences> = settingsDataStore,
 ) : DataStoreManager {
     override val appVersion: Flow<String> =
         settingsDataStore.data.map { preferences ->
@@ -363,12 +365,31 @@ internal class DataStoreManagerImpl(
     }
 
     override val recentMediaId =
-        settingsDataStore.data.map { preferences ->
-            preferences[RECENT_SONG_MEDIA_ID_KEY] ?: ""
+        if (playbackStateDataStore === settingsDataStore) {
+            settingsDataStore.data.map { preferences ->
+                preferences[RECENT_SONG_MEDIA_ID_KEY] ?: ""
+            }
+        } else {
+            combine(
+                playbackStateDataStore.data.map { it[RECENT_SONG_MEDIA_ID_KEY] },
+                settingsDataStore.data.map { it[RECENT_SONG_MEDIA_ID_KEY] },
+            ) { isolated, legacy ->
+                isolated ?: legacy ?: ""
+            }
         }
+
     override val recentPosition =
-        settingsDataStore.data.map { preferences ->
-            preferences[RECENT_SONG_POSITION_KEY] ?: "0"
+        if (playbackStateDataStore === settingsDataStore) {
+            settingsDataStore.data.map { preferences ->
+                preferences[RECENT_SONG_POSITION_KEY] ?: "0"
+            }
+        } else {
+            combine(
+                playbackStateDataStore.data.map { it[RECENT_SONG_POSITION_KEY] },
+                settingsDataStore.data.map { it[RECENT_SONG_POSITION_KEY] },
+            ) { isolated, legacy ->
+                isolated ?: legacy ?: "0"
+            }
         }
 
     override suspend fun saveRecentSong(
@@ -377,9 +398,9 @@ internal class DataStoreManagerImpl(
     ) {
         Logger.d("saveRecentSong", "$mediaId $position")
         withContext(Dispatchers.IO) {
-            settingsDataStore.edit { settings ->
-                settings[RECENT_SONG_MEDIA_ID_KEY] = mediaId
-                settings[RECENT_SONG_POSITION_KEY] = position.toString()
+            playbackStateDataStore.edit { state ->
+                state[RECENT_SONG_MEDIA_ID_KEY] = mediaId
+                state[RECENT_SONG_POSITION_KEY] = position.toString()
             }
         }
     }
@@ -2122,3 +2143,5 @@ internal class DataStoreManagerImpl(
 }
 
 expect fun createDataStoreInstance(): DataStore<Preferences>
+
+expect fun createPlaybackStateDataStoreInstance(): DataStore<Preferences>

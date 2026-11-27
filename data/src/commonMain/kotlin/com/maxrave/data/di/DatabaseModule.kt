@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.maxrave.data.dataStore.DataStoreManagerImpl
 import com.maxrave.data.dataStore.createDataStoreInstance
+import com.maxrave.data.dataStore.createPlaybackStateDataStoreInstance
 import com.maxrave.data.db.Converters
 import com.maxrave.data.db.MusicDatabase
 import com.maxrave.data.db.SyncDao
@@ -20,6 +21,7 @@ import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.spotify.Spotify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import org.koin.core.qualifier.named
 import org.koin.dsl.module
 import org.simpmusic.aiservice.AiClient
 import org.simpmusic.lyrics.SimpMusicLyricsClient
@@ -68,9 +70,16 @@ val databaseModule =
         single(createdAtStart = true) {
             createDataStoreInstance()
         }
+        // Isolated playback-position DataStore so frequent progress ticks never re-emit user settings.
+        single(named("playbackState")) {
+            createPlaybackStateDataStoreInstance()
+        }
         // DatastoreManager
         single<DataStoreManager>(createdAtStart = true) {
-            DataStoreManagerImpl(get<DataStore<Preferences>>())
+            DataStoreManagerImpl(
+                settingsDataStore = get<DataStore<Preferences>>(),
+                playbackStateDataStore = get<DataStore<Preferences>>(named("playbackState")),
+            )
         }
 
         // Move YouTube from Singleton to Koin DI

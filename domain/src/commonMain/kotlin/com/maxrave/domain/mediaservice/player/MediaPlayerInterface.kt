@@ -5,6 +5,7 @@ import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
+import com.maxrave.domain.data.player.KaraokeEffect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -218,6 +219,12 @@ interface MediaPlayerInterface {
 
     /** Independent of EQ/echo/reverb. Null bypasses 8D without changing its saved controls. */
     fun setEightD(effect: EightDEffect?) = Unit
+
+    /**
+     * Real-time mid-side karaoke vocal suppression, independent of EQ/echo/reverb/8D.
+     * Default no-op so platforms without karaoke DSP or test fakes never break.
+     */
+    fun setKaraokeEffect(effect: KaraokeEffect) {}
 
     /** A rejected native filter disables only the 8D controls, never the rest of playback. */
     val eightDAvailable: StateFlow<Boolean>

@@ -9,17 +9,22 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import com.maxrave.domain.data.player.GenericTracks
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
+import com.maxrave.domain.mediaservice.player.AudioVisualizerBus
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.logger.Logger
+import com.maxrave.media3.audio.KaraokeAudioProcessor
+import com.maxrave.media3.audio.VisualizerAudioProcessor
 import com.maxrave.media3.utils.BetterShuffleOrder
 
 /**
@@ -32,9 +37,13 @@ private const val TAG = "ExoPlayerAdapter"
 @OptIn(UnstableApi::class)
 class ExoPlayerAdapter(
     private val exoPlayer: ExoPlayer,
+    private val onKaraokeEffectChanged: ((KaraokeEffect) -> Unit)? = null,
 ) : MediaPlayerInterface {
     private val listeners = mutableListOf<MediaPlayerListener>()
     private val exoPlayerListener = ExoPlayerListenerImpl()
+
+    @Volatile
+    private var internalKaraokeEffect: KaraokeEffect = KaraokeEffect.OFF
 
     // Shuffle management
     // Maps original playlist index -> shuffled position
@@ -50,9 +59,15 @@ class ExoPlayerAdapter(
     // Playback control
     override fun play() = exoPlayer.play()
 
-    override fun pause() = exoPlayer.pause()
+    override fun pause() {
+        exoPlayer.pause()
+        AudioVisualizerBus.reset()
+    }
 
-    override fun stop() = exoPlayer.stop()
+    override fun stop() {
+        exoPlayer.stop()
+        AudioVisualizerBus.reset()
+    }
 
     override fun seekTo(positionMs: Long) = exoPlayer.seekTo(positionMs)
 
@@ -239,6 +254,14 @@ class ExoPlayerAdapter(
             exoPlayer.skipSilenceEnabled = value
         }
 
+    override fun setKaraokeEffect(effect: KaraokeEffect) {
+        val clamped = effect.clamped()
+        internalKaraokeEffect = clamped
+        onKaraokeEffectChanged?.invoke(clamped)
+    }
+
+    fun currentKaraokeEffect(): KaraokeEffect = internalKaraokeEffect
+
     // Listener management
     override fun addListener(listener: MediaPlayerListener) {
         listeners.add(listener)
@@ -250,6 +273,7 @@ class ExoPlayerAdapter(
 
     // Release resources
     override fun release() {
+        AudioVisualizerBus.reset()
         exoPlayer.removeListener(exoPlayerListener)
         listeners.clear()
         exoPlayer.release()
@@ -324,6 +348,9 @@ class ExoPlayerAdapter(
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (!isPlaying) {
+                AudioVisualizerBus.reset()
+            }
             listeners.forEach { it.onIsPlayingChanged(isPlaying) }
         }
 
@@ -544,6 +571,20 @@ class ExoPlayerAdapter(
         }
         exoPlayer.shuffleOrder = BetterShuffleOrder(shuffleOrder.toIntArray())
         Logger.d(TAG, "Removed original index $originalIndex from shuffle order")
+    }
+
+    companion object {
+        /**
+         * Creates Karaoke and Live Audio Visualizer processors for standalone ExoPlayer sinks.
+         */
+        fun createAudioProcessors(
+            karaokeEffectProvider: () -> KaraokeEffect,
+            isVisualizerActive: () -> Boolean = { true },
+        ): Array<AudioProcessor> =
+            arrayOf(
+                KaraokeAudioProcessor(karaokeEffectProvider),
+                VisualizerAudioProcessor(isSourceActive = isVisualizerActive),
+            )
     }
 }
 

@@ -12,3 +12,9 @@ actual fun createDataStoreInstance(): DataStore<Preferences> {
         producePath = { getKoin().get<Context>().filesDir.resolve("datastore/$SETTINGS_FILENAME.preferences_pb").absolutePath }
     )
 }
+
+actual fun createPlaybackStateDataStoreInstance(): DataStore<Preferences> {
+    return createDataStore(
+        producePath = { getKoin().get<Context>().filesDir.resolve("datastore/playback_state.preferences_pb").absolutePath }
+    )
+}

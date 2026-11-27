@@ -3,6 +3,7 @@ package com.simpmusic.media_jvm.mpv
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDOrbit
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.logger.Logger
 import com.sun.jna.Memory
 import com.sun.jna.Pointer
@@ -209,6 +210,8 @@ interface MpvPlayerHandle {
 
     fun syncEightD(): Boolean
 
+    fun setKaraokeEffect(effect: KaraokeEffect): Boolean = true
+
     fun setLooping(loop: Boolean)
 
     fun release()
@@ -284,6 +287,7 @@ class MpvPlayer private constructor(
          */
         private const val FX_REVERB_LABEL = "simpFxReverb"
         private const val FX_WIDE_LABEL = "simpFxWiden"
+        private const val FX_KARAOKE_LABEL = "simpFxKaraoke"
         private const val EIGHT_D_LABEL = "simp8D"
         private const val EIGHT_D_TEMPO_LABEL = "simp8DTempo"
         private const val SYNC_GUARD_NANOS = 500_000_000L
@@ -305,6 +309,9 @@ class MpvPlayer private constructor(
          */
         @Volatile
         private var reverbFiltersUnavailable = false
+
+        @Volatile
+        private var karaokeFiltersUnavailable = false
 
         /** Whether the convolution reverb can be built at all on this libmpv. */
         private val reverbFiltersSupported: Boolean
@@ -1146,6 +1153,10 @@ class MpvPlayer private constructor(
     @Volatile
     private var eqEntry: String? = null
 
+    /** The karaoke vocal-suppression entry, kept independent of EQ, spatial effects, and crossfade. */
+    @Volatile
+    private var karaokeEntry: String? = null
+
     /**
      * The echo and reverb entries currently installed, in chain order.
      *
@@ -1248,7 +1259,7 @@ class MpvPlayer private constructor(
      * speed change.
      */
     private fun applyAudioFilters(): Boolean {
-        val others = listOfNotNull(eqEntry) + fxEntries + crossfadeEntries
+        val others = listOfNotNull(eqEntry, karaokeEntry) + fxEntries + crossfadeEntries
         val eightD = eightDEntries()
         if (writeAf((others + eightD).joinToString(","))) {
             eightDInstalled = eightD.isNotEmpty()
@@ -1387,6 +1398,38 @@ class MpvPlayer private constructor(
     private fun applyFxEntries(entries: List<String>): Boolean {
         fxEntries = entries
         return applyAudioFilters()
+    }
+
+    override fun setKaraokeEffect(effect: KaraokeEffect): Boolean {
+        if (isReleased) return false
+        val clamped = effect.clamped()
+        val graph = karaokeGraph(clamped)
+        if (graph == null) {
+            karaokeEntry = null
+            return applyAudioFilters()
+        }
+        if (karaokeFiltersUnavailable) return false
+
+        karaokeEntry = "@$FX_KARAOKE_LABEL:lavfi=[$graph]"
+        if (applyAudioFilters()) return true
+
+        // Fallback for minimal libmpv builds without asplit/amix: retry with plain stereotools.
+        if (clamped.preserveBass) {
+            val fallbackGraph = karaokeGraph(clamped.copy(preserveBass = false))
+            if (fallbackGraph != null) {
+                karaokeEntry = "@$FX_KARAOKE_LABEL:lavfi=[$fallbackGraph]"
+                if (applyAudioFilters()) {
+                    Logger.w(TAG, "karaoke split graph unavailable; using full-band stereotools fallback")
+                    return true
+                }
+            }
+        }
+
+        karaokeEntry = null
+        karaokeFiltersUnavailable = true
+        applyAudioFilters()
+        Logger.w(TAG, "karaoke unavailable: this libmpv build rejected the karaoke filter graph")
+        return false
     }
 
     /**

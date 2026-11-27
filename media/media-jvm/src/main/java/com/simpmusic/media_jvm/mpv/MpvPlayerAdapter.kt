@@ -11,6 +11,7 @@ import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDOrbit
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.mediaservice.automix.TrackStructure
 import com.maxrave.domain.mediaservice.automix.TransitionPlan
@@ -22,8 +23,10 @@ import com.maxrave.domain.extension.isVideo
 import com.maxrave.domain.extension.now
 import com.maxrave.domain.extension.plusSeconds
 import com.maxrave.domain.manager.DataStoreManager
+import com.maxrave.domain.mediaservice.player.AudioVisualizerBus
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
+import com.maxrave.domain.mediaservice.player.WAVEFORM_BARS_PER_SECOND
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.logger.Logger
 import com.simpmusic.media_jvm.audio.ReverbIrFiles
@@ -58,10 +61,12 @@ import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.random.Random
 
 private const val TAG = "MpvPlayerAdapter"
@@ -1431,6 +1436,10 @@ class MpvPlayerAdapter internal constructor(
         if (effects != AudioEffects.NONE) {
             setAudioEffects(effects, ensureReverbIr(effects))
         }
+        val karaoke = internalKaraokeEffect
+        if (karaoke.isActive) {
+            setKaraokeEffect(karaoke)
+        }
         if (_eightDAvailable.value && eightDOrbit.snapshot().effect != null) {
             if (!setEightD(eightDOrbit)) markEightDUnavailable()
         }
@@ -1491,6 +1500,21 @@ class MpvPlayerAdapter internal constructor(
     /** Current effects, so a handle created later can be brought up to the same setting. */
     @Volatile
     private var internalAudioEffects: AudioEffects = AudioEffects.NONE
+
+    /** Current karaoke setting, applied to every live and future mpv handle. */
+    @Volatile
+    private var internalKaraokeEffect: KaraokeEffect = KaraokeEffect.OFF
+
+    // Desktop reactive visualizer feeder state (reused buffer: zero allocations on hot path, zero CPU when hidden).
+    private val desktopSpectrumScratch = FloatArray(AudioVisualizerBus.BAND_COUNT)
+
+    @Volatile
+    private var cachedVisualizerMediaId: String? = null
+
+    @Volatile
+    private var cachedVisualizerWaveform: FloatArray? = null
+
+    private var visualizerWaveformLookupJob: Job? = null
 
     /**
      * Whether the reverb entry is actually in the chain right now.
@@ -1556,6 +1580,15 @@ class MpvPlayerAdapter internal constructor(
                     }
                 }
             }
+        }
+    }
+
+    override fun setKaraokeEffect(effect: KaraokeEffect) {
+        val clamped = effect.clamped()
+        if (internalKaraokeEffect == clamped) return
+        internalKaraokeEffect = clamped
+        coroutineScope.launch {
+            forEachLiveHandle { it.setKaraokeEffect(clamped) }
         }
     }
 
@@ -1677,6 +1710,11 @@ class MpvPlayerAdapter internal constructor(
         }
         eightDCleanupJob?.cancel()
         eightDOrbit.setPlaying(false)
+        visualizerWaveformLookupJob?.cancel()
+        visualizerWaveformLookupJob = null
+        cachedVisualizerMediaId = null
+        cachedVisualizerWaveform = null
+        AudioVisualizerBus.reset()
         loadSeq.incrementAndGet()
         currentLoadJob?.cancel()
         currentLoadJob = null
@@ -1716,6 +1754,9 @@ class MpvPlayerAdapter internal constructor(
         val oldState = internalState
         internalState = newState
         eightDOrbit.setPlaying(newState == InternalState.PLAYING)
+        if (newState != InternalState.PLAYING) {
+            AudioVisualizerBus.reset()
+        }
 
         Logger.d(TAG, "State transition: $oldState -> $newState (playWhenReady=$internalPlayWhenReady)")
 
@@ -3283,6 +3324,10 @@ class MpvPlayerAdapter internal constructor(
                                 }
                             }
 
+                            if (internalState == InternalState.PLAYING && AudioVisualizerBus.hasActiveCollectors()) {
+                                feedDesktopVisualizerSpectrum(cachedPosition)
+                            }
+
                             // Check if should trigger crossfade.
                             // Use currentPlayer's time (not the timeline player) for trigger detection.
                             // Block when paused (internalPlayWhenReady=false) to prevent
@@ -3351,6 +3396,84 @@ class MpvPlayerAdapter internal constructor(
     private fun stopPositionUpdates() {
         positionUpdateJob?.cancel()
         positionUpdateJob = null
+    }
+
+    /**
+     * Lightweight ~20 fps reactive spectrum generator for Desktop MPV.
+     *
+     * Runs ONLY while playing AND [AudioVisualizerBus.hasActiveCollectors] is true (zero CPU when
+     * hidden). Uses cached `~/.simpmusic/waveforms/<id>.wf` loudness envelopes when available,
+     * combined with deterministic multi-harmonic band shaping scaled by output volume so it stays
+     * featherlight on 2-core CPUs without running a second ffmpeg decoder.
+     */
+    private fun feedDesktopVisualizerSpectrum(positionMs: Long) {
+        val mediaId = currentMediaItem?.mediaId
+        if (mediaId != null && mediaId != cachedVisualizerMediaId) {
+            cachedVisualizerMediaId = mediaId
+            cachedVisualizerWaveform = null
+            visualizerWaveformLookupJob?.cancel()
+            visualizerWaveformLookupJob =
+                coroutineScope.launch(Dispatchers.IO) {
+                    val safeName = mediaId.replace(Regex("[^A-Za-z0-9_-]"), "_")
+                    val wfFile = File(System.getProperty("user.home"), ".simpmusic${File.separator}waveforms${File.separator}$safeName.wf")
+                    val bars =
+                        if (wfFile.isFile && wfFile.length() in 1L..2_000_000L) {
+                            runCatching {
+                                val bytes = wfFile.readBytes()
+                                FloatArray(bytes.size) { (bytes[it].toInt() and 0xFF) / 255f }
+                            }.getOrNull()
+                        } else {
+                            null
+                        }
+                    if (cachedVisualizerMediaId == mediaId) {
+                        cachedVisualizerWaveform = bars
+                    }
+                }
+        }
+
+        val gain = (internalVolume * internalSleepFadeFactor).coerceIn(0f, 1f)
+        if (gain <= 0.001f) {
+            AudioVisualizerBus.reset()
+            return
+        }
+
+        val timeSec = (positionMs.coerceAtLeast(0L) / 1000.0) * internalPlaybackSpeed.coerceAtLeast(0.25f)
+        val wf = cachedVisualizerWaveform
+        val baseEnergy =
+            if (wf != null && wf.isNotEmpty()) {
+                val exactIdx = (positionMs / 1000.0) * WAVEFORM_BARS_PER_SECOND
+                val lo = exactIdx.toInt().coerceIn(0, wf.lastIndex)
+                val hi = (lo + 1).coerceAtMost(wf.lastIndex)
+                val frac = (exactIdx - lo).toFloat().coerceIn(0f, 1f)
+                (wf[lo] * (1f - frac) + wf[hi] * frac).coerceIn(0.08f, 1f)
+            } else {
+                val phrase = 0.58 + 0.24 * sin(timeSec * 1.45) + 0.14 * sin(timeSec * 3.1 + 0.7)
+                phrase.toFloat().coerceIn(0.22f, 0.96f)
+            }
+
+        val seed = ((mediaId?.hashCode() ?: 0) and 0xFFFF) * 0.013
+        val karaoke = internalKaraokeEffect
+        val karaokeDip = if (karaoke.isActive) karaoke.clampedSuppression * 0.45f else 0f
+
+        val count = AudioVisualizerBus.BAND_COUNT
+        for (i in 0 until count) {
+            val normPos = i.toFloat() / (count - 1)
+            // Musical pink-spectrum tilt: fuller bass/low-mids, crisp dancing highs.
+            val contour = 0.95f - 0.35f * normPos
+            val beatRate = 2.1 + i * 0.37
+            val shimmerRate = 5.3 + i * 0.61
+            val wave1 = 0.5 + 0.5 * sin(timeSec * beatRate + i * 0.55 + seed)
+            val wave2 = 0.5 + 0.5 * sin(timeSec * shimmerRate - i * 0.38 + seed * 1.7)
+            val bandMotion = (0.35 + 0.45 * wave1 + 0.20 * wave2).toFloat()
+            val vocalBandFactor =
+                if (karaokeDip > 0f && i in 5..15) {
+                    1f - karaokeDip
+                } else {
+                    1f
+                }
+            desktopSpectrumScratch[i] = (baseEnergy * contour * bandMotion * vocalBandFactor * gain).coerceIn(0f, 1f)
+        }
+        AudioVisualizerBus.publishRawSpectrum(desktopSpectrumScratch)
     }
 
     /**

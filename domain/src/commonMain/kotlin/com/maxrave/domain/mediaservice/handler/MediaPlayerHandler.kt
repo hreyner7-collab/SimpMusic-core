@@ -7,6 +7,7 @@ import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
 import com.maxrave.domain.data.player.GenericMediaItem
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.utils.isEndlessQueueId
@@ -158,6 +159,9 @@ interface MediaPlayerHandler {
 
     // Settings
     fun mayBeNormalizeVolume()
+
+    /** Real-time karaoke vocal suppression; default no-op so iOS and test fakes never break. */
+    fun setKaraokeEffect(effect: KaraokeEffect) {}
 
     fun mayBeSaveRecentSong(runBlocking: Boolean = false)
 

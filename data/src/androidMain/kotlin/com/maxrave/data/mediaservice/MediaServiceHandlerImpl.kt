@@ -43,6 +43,7 @@ import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import com.maxrave.domain.data.player.GenericTracks
+import com.maxrave.domain.data.player.KaraokeEffect
 import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.data.player.ReverbEffect
@@ -483,6 +484,16 @@ internal class MediaServiceHandlerImpl(
                     null
                 }
             }.distinctUntilChanged().collect { player.setEightD(it) }
+        }
+        backgroundScope.launch {
+            var lastKaraoke: KaraokeEffect? = null
+            dataStoreManager.getString(KaraokeEffect.DATASTORE_KEY).collect { raw ->
+                val effect = KaraokeEffect.decodeFromJson(raw)
+                if (effect != lastKaraoke) {
+                    lastKaraoke = effect
+                    player.setKaraokeEffect(effect)
+                }
+            }
         }
         normalizeVolume =
             runBlocking { dataStoreManager.normalizeVolume.first() == TRUE }
@@ -1476,6 +1487,10 @@ internal class MediaServiceHandlerImpl(
                 isCrossfading = false,
             )
         }
+    }
+
+    override fun setKaraokeEffect(effect: KaraokeEffect) {
+        player.setKaraokeEffect(effect.clamped())
     }
 
     override fun shufflePlaylist(randomTrackIndex: Int) {

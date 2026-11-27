@@ -117,6 +117,11 @@ actual fun getDatabaseBuilder(converters: Converters) : RoomDatabase.Builder<Mus
             object : RoomDatabase.Callback() {
                 override fun onOpen(connection: SQLiteConnection) {
                     super.onOpen(connection)
+                    runCatching {
+                        connection.execSQL("PRAGMA synchronous = NORMAL")
+                        connection.execSQL("PRAGMA temp_store = MEMORY")
+                        connection.execSQL("PRAGMA cache_size = -16000")
+                    }
                     connection.execSQL(
                         "CREATE TRIGGER  IF NOT EXISTS on_delete_pair_song_local_playlist AFTER DELETE ON pair_song_local_playlist\n" +
                             "FOR EACH ROW\n" +

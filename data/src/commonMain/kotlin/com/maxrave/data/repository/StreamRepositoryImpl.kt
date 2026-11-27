@@ -60,7 +60,7 @@ internal class StreamRepositoryImpl(
     }
 
     /** A stream lookup slower than this gets a second, racing attempt. */
-    private val HEDGE_AFTER_MS = 9000L
+    private val HEDGE_AFTER_MS = 2500L
 
     private val inFlightMutex = Mutex()
     private val inFlightPlayers = HashMap<String, Deferred<Result<Triple<String?, PlayerResponse, MediaType>>>>()

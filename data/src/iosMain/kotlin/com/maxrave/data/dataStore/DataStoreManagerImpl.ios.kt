@@ -23,3 +23,17 @@ producePath = {
     requireNotNull(documentDirectory).path + "/$SETTINGS_FILENAME.preferences_pb"
 }
 )
+
+@OptIn(ExperimentalForeignApi::class)
+actual fun createPlaybackStateDataStoreInstance(): DataStore<Preferences> = createDataStore(
+    producePath = {
+        val documentDirectory: NSURL? = NSFileManager.defaultManager.URLForDirectory(
+            directory = NSDocumentDirectory,
+            inDomain = NSUserDomainMask,
+            appropriateForURL = null,
+            create = false,
+            error = null,
+        )
+        requireNotNull(documentDirectory).path + "/playback_state.preferences_pb"
+    },
+)

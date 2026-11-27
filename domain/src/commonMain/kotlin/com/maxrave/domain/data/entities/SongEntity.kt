@@ -1,13 +1,23 @@
 package com.maxrave.domain.data.entities
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.maxrave.domain.data.entities.DownloadState.STATE_NOT_DOWNLOADED
 import com.maxrave.domain.data.type.RecentlyType
 import com.maxrave.domain.extension.now
 import kotlinx.datetime.LocalDateTime
 
-@Entity(tableName = "song")
+@Entity(
+    tableName = "song",
+    indices = [
+        Index(value = ["liked"]),
+        Index(value = ["downloadState"]),
+        Index(value = ["inLibrary"]),
+        Index(value = ["totalPlayTime"]),
+        Index(value = ["favoriteAt"]),
+    ],
+)
 data class SongEntity(
     @PrimaryKey(autoGenerate = false) val videoId: String = "",
     val albumId: String? = null,
