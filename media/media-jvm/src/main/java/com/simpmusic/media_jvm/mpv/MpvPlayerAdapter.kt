@@ -114,6 +114,14 @@ class MpvPlayerAdapter internal constructor(
 
     private fun InternalState.isInReadyState(): Boolean = this == InternalState.READY || this == InternalState.PLAYING || this == InternalState.PAUSED
 
+    private val warmPlayerLock = Any()
+
+    @Volatile
+    private var warmAudioPlayer: MpvPlayerHandle? = null
+
+    @Volatile
+    private var isAdapterReleased = false
+
     init {
         if (playerFactory == null && MpvLibrary.INSTANCE == null) {
             Logger.e(TAG, "libmpv not available — playback will fail until mpv is installed.")
@@ -174,14 +182,6 @@ class MpvPlayerAdapter internal constructor(
 
     @Volatile
     private var currentPlayer: MpvPlayerHandle? = null
-
-    private val warmPlayerLock = Any()
-
-    @Volatile
-    private var warmAudioPlayer: MpvPlayerHandle? = null
-
-    @Volatile
-    private var isAdapterReleased = false
 
     private fun replenishWarmAudioPlayerAsync() {
         if (playerFactory != null || isAdapterReleased) return
