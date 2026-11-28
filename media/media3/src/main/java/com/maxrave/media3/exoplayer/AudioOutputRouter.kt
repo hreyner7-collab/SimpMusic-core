@@ -74,7 +74,7 @@ internal class AudioOutputRouter(
             preferredDevice = null
             onPreferredChanged(null)
         }
-        val activeId = activeDeviceId(devices)
+        val activeIds = activeDeviceIds(devices)
         _outputs.value =
             devices
                 .map { device ->
@@ -82,7 +82,7 @@ internal class AudioOutputRouter(
                         id = device.id.toString(),
                         name = nameOf(device),
                         kind = kindOf(device.type) ?: AudioOutputKind.OTHER,
-                        isActive = device.id == activeId,
+                        isActive = device.id in activeIds,
                     )
                 }.sortedBy { if (it.kind == AudioOutputKind.DEVICE_SPEAKER) 0 else 1 }
     }
@@ -99,17 +99,19 @@ internal class AudioOutputRouter(
             }
     }
 
-    private fun activeDeviceId(devices: List<AudioDeviceInfo>): Int? {
-        preferredDevice?.let { picked -> if (devices.any { it.id == picked.id }) return picked.id }
-        return systemDeviceId(devices)
+    private fun activeDeviceIds(devices: List<AudioDeviceInfo>): Set<Int> {
+        preferredDevice?.let { picked -> if (devices.any { it.id == picked.id }) return setOf(picked.id) }
+        return systemDeviceIds(devices)
     }
 
-    // Where the system itself sends media, ignoring this app's pick — per-player routing does not
-    // show up in the system's own answer.
-    private fun systemDeviceId(devices: List<AudioDeviceInfo>): Int? {
+    // Where the system itself sends media, ignoring this app's pick — returns ALL active routes
+    // so Samsung Dual Audio / Auracast multi-speaker connections all show as active.
+    private fun systemDeviceIds(devices: List<AudioDeviceInfo>): Set<Int> {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val routed = audioManager?.getAudioDevicesForAttributes(MEDIA_ATTRIBUTES).orEmpty()
-            routed.firstNotNullOfOrNull { route -> devices.firstOrNull { it.id == route.id } }?.let { return it.id }
+            val validIds = devices.mapTo(HashSet()) { it.id }
+            val active = routed.mapNotNullTo(LinkedHashSet()) { route -> route.id.takeIf { it in validIds } }
+            if (active.isNotEmpty()) return active
         }
         // Below Android 13 nothing says where media is routed, so answer the way the system itself
         // chooses: a headset over the speaker, Bluetooth over a wire.
@@ -122,8 +124,10 @@ internal class AudioOutputRouter(
                 AudioOutputKind.OTHER -> 1
                 else -> 0
             }
-        }?.id
+        }?.let { setOf(it.id) } ?: emptySet()
     }
+
+    private fun systemDeviceId(devices: List<AudioDeviceInfo>): Int? = systemDeviceIds(devices).firstOrNull()
 
     // The speaker takes the name the owner gave the phone in Settings — "maxrave's Phone" — rather
     // than a model number. Anything else keeps its product name ("Pixel Buds Pro 2"), except that a

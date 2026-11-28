@@ -314,4 +314,37 @@ class MpvPlayerShuffleAndGuardsTest {
                 scope.cancel()
             }
         }
+
+    @Test
+    fun multiOutputSpawnsAndReleasesMirrorHandlesAndClampsSyncDelay() {
+        val handles = CopyOnWriteArrayList<FakeHandle>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val adapter =
+            MpvPlayerAdapter(
+                coroutineScope = scope,
+                dataStoreManager = fakeDataStore(),
+                streamRepository = fakeStreamRepository(),
+                playerFactory = { _, _, _ -> FakeHandle().also { handles += it } },
+            )
+        try {
+            assertTrue(adapter.multiOutputSupported)
+            adapter.toggleSecondaryAudioOutput("wasapi/{jbl-1}")
+            adapter.toggleSecondaryAudioOutput("wasapi/{alexa-1}")
+            assertEquals(setOf("wasapi/{jbl-1}", "wasapi/{alexa-1}"), adapter.secondaryAudioOutputIds.value)
+            assertEquals(2, handles.size)
+
+            adapter.setAudioOutputDelayMs("wasapi/{alexa-1}", 999)
+            assertEquals(500, adapter.audioOutputDelaysMs.value["wasapi/{alexa-1}"])
+            adapter.setAudioOutputDelayMs("wasapi/{alexa-1}", -999)
+            assertEquals(-500, adapter.audioOutputDelaysMs.value["wasapi/{alexa-1}"])
+
+            adapter.toggleSecondaryAudioOutput("wasapi/{jbl-1}")
+            assertEquals(setOf("wasapi/{alexa-1}"), adapter.secondaryAudioOutputIds.value)
+            assertTrue(handles[0].isReleased)
+            assertFalse(handles[1].isReleased)
+        } finally {
+            adapter.release()
+            scope.cancel()
+        }
+    }
 }

@@ -260,6 +260,27 @@ interface MediaPlayerInterface {
      */
     fun refreshAudioOutputs() = Unit
 
+    /** True when the backend can play into multiple audio endpoints simultaneously (Desktop). */
+    val multiOutputSupported: Boolean
+        get() = false
+
+    /** Additional secondary audio output IDs mirrored in sync alongside the primary output. */
+    val secondaryAudioOutputIds: StateFlow<Set<String>>
+        get() = NO_SECONDARY_AUDIO_OUTPUTS
+
+    /** Per-output sync delay offsets in milliseconds (-500..500) to align Bluetooth/wired speakers. */
+    val audioOutputDelaysMs: StateFlow<Map<String, Int>>
+        get() = NO_AUDIO_OUTPUT_DELAYS
+
+    /** Toggles a secondary speaker on/off for simultaneous multi-speaker playback. */
+    fun toggleSecondaryAudioOutput(id: String) = Unit
+
+    /** Adjusts the per-speaker sync delay offset in milliseconds (-500..500). */
+    fun setAudioOutputDelayMs(
+        id: String,
+        delayMs: Int,
+    ) = Unit
+
     /**
      * The loudness outline of [mediaId]'s audio for the SoundCloud style's waveform: one value per
      * 1 / [WAVEFORM_BARS_PER_SECOND] seconds of the track, each 0..1 against the track's loudest
@@ -286,4 +307,6 @@ interface MediaPlayerInterface {
 
 // What a backend that cannot list its outputs reports: nothing, and never anything else.
 private val NO_AUDIO_OUTPUTS: StateFlow<List<AudioOutput>> = MutableStateFlow(emptyList())
+private val NO_SECONDARY_AUDIO_OUTPUTS: StateFlow<Set<String>> = MutableStateFlow(emptySet())
+private val NO_AUDIO_OUTPUT_DELAYS: StateFlow<Map<String, Int>> = MutableStateFlow(emptyMap())
 private val NO_EIGHT_D: StateFlow<Boolean> = MutableStateFlow(false)

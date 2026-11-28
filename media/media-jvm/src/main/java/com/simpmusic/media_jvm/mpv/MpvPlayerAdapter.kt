@@ -424,6 +424,7 @@ class MpvPlayerAdapter internal constructor(
                     }
                     Logger.d(TAG, "Play: calling mpv play")
                     player.play()
+                    syncMirrorsPlay(fromStart = internalState == InternalState.ENDED)
                     transitionToState(InternalState.PLAYING)
                     internalPlayWhenReady = true
                 } ?: Logger.w(TAG, "Play called but currentPlayer is null")
@@ -483,6 +484,7 @@ class MpvPlayerAdapter internal constructor(
                     currentPlayer?.let { player ->
                         Logger.d(TAG, "Pause: calling mpv pause")
                         player.pause()
+                        syncMirrorsPause()
                         transitionToState(InternalState.PAUSED)
                         internalPlayWhenReady = false
                     }
@@ -530,6 +532,7 @@ class MpvPlayerAdapter internal constructor(
             internalPlayWhenReady = false
             Logger.d(TAG, "Stop called")
             cancelCrossfadeAndCleanup(revertIndex = false)
+            stopMirrorsInternal()
             currentPlayer?.stop()
             cleanupCurrentPlayerInternal()
             cachedPosition = 0L
@@ -561,6 +564,7 @@ class MpvPlayerAdapter internal constructor(
             currentPlayer?.let { player ->
                 try {
                     player.seekTo(positionMs)
+                    syncMirrorsSeek(positionMs)
                     Logger.d(TAG, "Seeked to position: $positionMs")
                     // Same contract as the Android adapter: every seek is reported, whoever asked
                     // for it (seek bar, lyric tap, ±5 s, Control Center, SponsorBlock).
@@ -1355,6 +1359,7 @@ class MpvPlayerAdapter internal constructor(
                 // mpv volume: 0-100 (100 = unattenuated). Map our 0.0-1.0 to 0-100.
                 val percent = (internalVolume * 100).toInt()
                 forEachLiveHandle { it.setMasterVolume(percent) }
+                syncMirrorsVolume(percent)
             }
             notifyListeners { onVolumeChanged(internalVolume) }
         }
@@ -1637,9 +1642,24 @@ class MpvPlayerAdapter internal constructor(
     private val _audioOutputs = MutableStateFlow<List<AudioOutput>>(emptyList())
     override val audioOutputs: StateFlow<List<AudioOutput>> = _audioOutputs.asStateFlow()
 
+    override val multiOutputSupported: Boolean = true
+
+    private val _secondaryAudioOutputIds = MutableStateFlow<Set<String>>(emptySet())
+    override val secondaryAudioOutputIds: StateFlow<Set<String>> = _secondaryAudioOutputIds.asStateFlow()
+
+    private val _audioOutputDelaysMs = MutableStateFlow<Map<String, Int>>(emptyMap())
+    override val audioOutputDelaysMs: StateFlow<Map<String, Int>> = _audioOutputDelaysMs.asStateFlow()
+
     /** The mpv device the user picked, or null for mpv's `auto` (the system default). */
     @Volatile
     private var preferredAudioDevice: String? = null
+
+    private val mirrorPlayers = LinkedHashMap<String, MpvPlayerHandle>()
+    private val secondaryOutputIds = LinkedHashSet<String>()
+    private val outputDelaysMs = LinkedHashMap<String, Int>()
+    @Volatile
+    private var lastLoadedPlaybackUrl: String? = null
+    private var mirrorDriftJob: Job? = null
 
     override suspend fun loadWaveform(
         mediaId: String,
@@ -1669,9 +1689,157 @@ class MpvPlayerAdapter internal constructor(
         // Same hop as setEqualizer: mpv properties are written on the player thread, and every live
         // handle has to move together or the two halves of a crossfade play out of different speakers.
         coroutineScope.launch {
+            if (preferredAudioDevice != null && secondaryOutputIds.remove(preferredAudioDevice)) {
+                mirrorPlayers.remove(preferredAudioDevice)?.let { runCatching { it.release() } }
+                _secondaryAudioOutputIds.value = secondaryOutputIds.toSet()
+            }
             forEachLiveHandle { it.setAudioDevice(preferredAudioDevice ?: MPV_AUTO_DEVICE) }
             readAudioOutputs()
         }
+    }
+
+    override fun toggleSecondaryAudioOutput(id: String) {
+        if (id == MPV_AUTO_DEVICE || id == preferredAudioDevice) return
+        coroutineScope.launch {
+            if (secondaryOutputIds.contains(id)) {
+                secondaryOutputIds.remove(id)
+                mirrorPlayers.remove(id)?.let { runCatching { it.release() } }
+                if (secondaryOutputIds.isEmpty()) {
+                    mirrorDriftJob?.cancel()
+                    mirrorDriftJob = null
+                }
+            } else {
+                secondaryOutputIds.add(id)
+                spawnMirrorHandle(id)
+                ensureMirrorDriftSyncRunning()
+            }
+            _secondaryAudioOutputIds.value = secondaryOutputIds.toSet()
+            readAudioOutputs()
+        }
+    }
+
+    override fun setAudioOutputDelayMs(
+        id: String,
+        delayMs: Int,
+    ) {
+        val clamped = delayMs.coerceIn(-500, 500)
+        coroutineScope.launch {
+            outputDelaysMs[id] = clamped
+            _audioOutputDelaysMs.value = outputDelaysMs.toMap()
+            val mirror = mirrorPlayers[id] ?: return@launch
+            val anchorMs = currentPlayer?.time ?: cachedPosition
+            mirror.seekTo((anchorMs + clamped).coerceAtLeast(0L))
+        }
+    }
+
+    private fun spawnMirrorHandle(deviceId: String): MpvPlayerHandle? {
+        mirrorPlayers.remove(deviceId)?.let { runCatching { it.release() } }
+        val mirror =
+            if (playerFactory != null) {
+                playerFactory.invoke(true, 4, false)
+            } else {
+                MpvPlayer.create(audioOnly = true, networkCacheSeconds = 4, liveStream = false)
+            } ?: return null
+        mirror.setAudioDevice(deviceId)
+        mirror.applyPlaybackLevels()
+        mirrorPlayers[deviceId] = mirror
+        val url = lastLoadedPlaybackUrl
+        if (!url.isNullOrBlank()) {
+            val anchorMs = currentPlayer?.time ?: cachedPosition
+            val targetMs = (anchorMs + (outputDelaysMs[deviceId] ?: 0)).coerceAtLeast(0L)
+            val startPaused = internalState != InternalState.PLAYING
+            mirror.loadFile(url, startPaused = startPaused, startMs = targetMs)
+        }
+        return mirror
+    }
+
+    private fun reloadMirrorsInternal(
+        url: String,
+        startMs: Long,
+        playNow: Boolean,
+    ) {
+        lastLoadedPlaybackUrl = url
+        if (secondaryOutputIds.isEmpty()) return
+        for (id in secondaryOutputIds.toList()) {
+            val existing = mirrorPlayers[id]
+            val handle =
+                if (existing != null && !existing.isReleased) {
+                    existing
+                } else {
+                    spawnMirrorHandle(id)?.also { mirror ->
+                        if (playNow) mirror.play()
+                    } ?: continue
+                }
+            handle.applyPlaybackLevels()
+            val targetMs = (startMs + (outputDelaysMs[id] ?: 0)).coerceAtLeast(0L)
+            handle.loadFile(url, startPaused = !playNow, startMs = targetMs)
+        }
+        ensureMirrorDriftSyncRunning()
+    }
+
+    private fun syncMirrorsPlay(fromStart: Boolean) {
+        mirrorPlayers.forEach { (id, mirror) ->
+            if (!mirror.isReleased) {
+                val baseMs = if (fromStart) 0L else (currentPlayer?.time ?: cachedPosition)
+                mirror.seekTo((baseMs + (outputDelaysMs[id] ?: 0)).coerceAtLeast(0L))
+                mirror.play()
+            }
+        }
+    }
+
+    private fun syncMirrorsPause() {
+        mirrorPlayers.values.forEach { mirror ->
+            if (!mirror.isReleased) mirror.pause()
+        }
+    }
+
+    private fun stopMirrorsInternal() {
+        mirrorPlayers.values.forEach { mirror ->
+            if (!mirror.isReleased) mirror.stop()
+        }
+    }
+
+    private fun syncMirrorsSeek(positionMs: Long) {
+        mirrorPlayers.forEach { (id, mirror) ->
+            if (!mirror.isReleased) {
+                mirror.seekTo((positionMs + (outputDelaysMs[id] ?: 0)).coerceAtLeast(0L))
+            }
+        }
+    }
+
+    private fun syncMirrorsVolume(percent: Int) {
+        mirrorPlayers.values.forEach { mirror ->
+            if (!mirror.isReleased) mirror.setMasterVolume(percent)
+        }
+    }
+
+    private fun releaseMirrorsInternal() {
+        mirrorDriftJob?.cancel()
+        mirrorDriftJob = null
+        mirrorPlayers.values.forEach { mirror -> runCatching { mirror.release() } }
+        mirrorPlayers.clear()
+        secondaryOutputIds.clear()
+        _secondaryAudioOutputIds.value = emptySet()
+    }
+
+    private fun ensureMirrorDriftSyncRunning() {
+        if (mirrorDriftJob?.isActive == true || secondaryOutputIds.isEmpty() || playerFactory != null) return
+        mirrorDriftJob =
+            coroutineScope.launch {
+                while (isActive && secondaryOutputIds.isNotEmpty() && !isAdapterReleased) {
+                    delay(1_500L)
+                    if (internalState != InternalState.PLAYING) continue
+                    val primaryTime = currentPlayer?.time ?: continue
+                    mirrorPlayers.forEach { (id, mirror) ->
+                        if (!mirror.isReleased) {
+                            val expectedMs = (primaryTime + (outputDelaysMs[id] ?: 0)).coerceAtLeast(0L)
+                            if (abs(mirror.time - expectedMs) > 65L) {
+                                mirror.seekTo(expectedMs)
+                            }
+                        }
+                    }
+                }
+            }
     }
 
     override fun refreshAudioOutputs() {
@@ -1690,7 +1858,11 @@ class MpvPlayerAdapter internal constructor(
         handle.currentAudioOutputDriver()?.let { audioOutputDriver = it }
         val driver = audioOutputDriver ?: return
         val json = handle.audioDeviceListJson() ?: return
-        _audioOutputs.value = parseAudioOutputs(json, driver, handle.audioDevice())
+        val activeSecondary = secondaryOutputIds.toSet()
+        _audioOutputs.value =
+            parseAudioOutputs(json, driver, handle.audioDevice()).map { out ->
+                if (out.id in activeSecondary) out.copy(isActive = true) else out
+            }
     }
 
     // ========== Listener Management ==========
@@ -1735,6 +1907,7 @@ class MpvPlayerAdapter internal constructor(
         crossfadeFromIndex = -1
 
         coroutineScope.cancel()
+        releaseMirrorsInternal()
         cleanupCurrentPlayerInternal()
         clearAllPrecacheInternal()
         listeners.clear()
@@ -1949,11 +2122,14 @@ class MpvPlayerAdapter internal constructor(
                         if (playNow) {
                             player.play()
                         }
+                        reloadMirrorsInternal(buildPlaybackUrl(cachedPrecache.source), startPositionMs, playNow)
                         Logger.d(TAG, "Playing from precache for $videoId")
                     } else {
                         val source = resolvedSource
                         if (source != null) {
-                            player.loadFile(buildPlaybackUrl(source), startPaused = !playNow)
+                            val playbackUrl = buildPlaybackUrl(source)
+                            player.loadFile(playbackUrl, startPaused = !playNow)
+                            reloadMirrorsInternal(playbackUrl, startPositionMs, playNow)
                         } else {
                             Logger.e(TAG, "resolvedSource is null — should not happen")
                             transitionToState(InternalState.ERROR)
@@ -2452,11 +2628,16 @@ class MpvPlayerAdapter internal constructor(
                                 Logger.e(TAG, "Failed to extract URL for crossfade")
                                 null
                             } else {
+                                val playbackUrl = buildPlaybackUrl(nextSource)
+                                lastLoadedPlaybackUrl = playbackUrl
                                 createMediaPlayerInternal(nextSource)?.also { newPlayer ->
-                                    newPlayer.loadFile(buildPlaybackUrl(nextSource), startPaused = true, startMs = incomingStartMs)
+                                    newPlayer.loadFile(playbackUrl, startPaused = true, startMs = incomingStartMs)
                                 }
                             }
                         }
+                    if (cachedPrecache != null) {
+                        lastLoadedPlaybackUrl = buildPlaybackUrl(cachedPrecache.source)
+                    }
                     // A precached handle sits paused at 0; its cache already holds the intro.
                     if (cachedPrecache?.player != null && incomingStartMs > 0) nextPlayer?.seekTo(incomingStartMs)
 
