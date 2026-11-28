@@ -880,8 +880,8 @@ class MpvPlayer private constructor(
         playedSinceLoad = !startPaused
         setPropertyString("pause", if (startPaused) "yes" else "no")
         // `start` is read by the next loadfile, so it rides on the handle like the options in [create]:
-        // `time-pos` cannot be set yet, since nothing is loaded. AutoMix starts a track past its intro.
-        if (startMs > 0) setPropertyString("start", (startMs / 1000.0).toString())
+        // reset to "none" when startMs == 0 so a prior mid-track start doesn't leak to the next track.
+        setPropertyString("start", if (startMs > 0) (startMs / 1000.0).toString() else "none")
         command("loadfile", url, "replace")
     }
 

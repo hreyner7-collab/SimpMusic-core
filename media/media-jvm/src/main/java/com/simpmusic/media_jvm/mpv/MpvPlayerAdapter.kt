@@ -1732,7 +1732,7 @@ class MpvPlayerAdapter internal constructor(
         }
     }
 
-    private fun spawnMirrorHandle(deviceId: String): MpvPlayerHandle? {
+    private suspend fun spawnMirrorHandle(deviceId: String): MpvPlayerHandle? {
         mirrorPlayers.remove(deviceId)?.let { runCatching { it.release() } }
         val mirror =
             if (playerFactory != null) {
@@ -1741,19 +1741,33 @@ class MpvPlayerAdapter internal constructor(
                 MpvPlayer.create(audioOnly = true, networkCacheSeconds = 4, liveStream = false)
             } ?: return null
         mirror.setAudioDevice(deviceId)
+        mirror.setMute(false)
         mirror.applyPlaybackLevels()
         mirrorPlayers[deviceId] = mirror
-        val url = lastLoadedPlaybackUrl
+        var url = lastLoadedPlaybackUrl
+        if (url.isNullOrBlank()) {
+            val item = currentMediaItem
+            if (item != null) {
+                val resolved = withContext(Dispatchers.IO) { runCatching { extractPlayableUrl(item) }.getOrNull() }
+                if (resolved != null && resolved.url.isNotEmpty()) {
+                    url = buildPlaybackUrl(resolved)
+                    lastLoadedPlaybackUrl = url
+                }
+            }
+        }
         if (!url.isNullOrBlank()) {
             val anchorMs = currentPlayer?.time ?: cachedPosition
             val targetMs = (anchorMs + (outputDelaysMs[deviceId] ?: 0)).coerceAtLeast(0L)
-            val startPaused = internalState != InternalState.PLAYING
-            mirror.loadFile(url, startPaused = startPaused, startMs = targetMs)
+            val isNowPlaying = internalState == InternalState.PLAYING
+            mirror.loadFile(url, startPaused = !isNowPlaying, startMs = targetMs)
+            if (isNowPlaying) {
+                mirror.play()
+            }
         }
         return mirror
     }
 
-    private fun reloadMirrorsInternal(
+    private suspend fun reloadMirrorsInternal(
         url: String,
         startMs: Long,
         playNow: Boolean,
@@ -1766,13 +1780,16 @@ class MpvPlayerAdapter internal constructor(
                 if (existing != null && !existing.isReleased) {
                     existing
                 } else {
-                    spawnMirrorHandle(id)?.also { mirror ->
-                        if (playNow) mirror.play()
-                    } ?: continue
+                    spawnMirrorHandle(id) ?: continue
                 }
+            handle.setAudioDevice(id)
+            handle.setMute(false)
             handle.applyPlaybackLevels()
             val targetMs = (startMs + (outputDelaysMs[id] ?: 0)).coerceAtLeast(0L)
             handle.loadFile(url, startPaused = !playNow, startMs = targetMs)
+            if (playNow) {
+                handle.play()
+            }
         }
         ensureMirrorDriftSyncRunning()
     }
