@@ -1660,6 +1660,7 @@ class MpvPlayerAdapter internal constructor(
     @Volatile
     private var lastLoadedPlaybackUrl: String? = null
     private var mirrorDriftJob: Job? = null
+    internal var bluetoothAudioConnector: BluetoothAudioConnector = WindowsBluetoothAudioHelper
 
     override suspend fun loadWaveform(
         mediaId: String,
@@ -1685,6 +1686,22 @@ class MpvPlayerAdapter internal constructor(
     }
 
     override fun selectAudioOutput(id: String?) {
+        if (id != null && id.startsWith(WindowsBluetoothAudioHelper.BT_CONNECT_PREFIX)) {
+            coroutineScope.launch {
+                val liveId = connectBluetoothSpeakerAndResolve(id) ?: run {
+                    readAudioOutputs()
+                    return@launch
+                }
+                preferredAudioDevice = liveId
+                if (secondaryOutputIds.remove(liveId)) {
+                    mirrorPlayers.remove(liveId)?.let { runCatching { it.release() } }
+                    _secondaryAudioOutputIds.value = secondaryOutputIds.toSet()
+                }
+                forEachLiveHandle { it.setAudioDevice(liveId) }
+                readAudioOutputs()
+            }
+            return
+        }
         preferredAudioDevice = id?.takeIf { it != MPV_AUTO_DEVICE }
         // Same hop as setEqualizer: mpv properties are written on the player thread, and every live
         // handle has to move together or the two halves of a crossfade play out of different speakers.
@@ -1701,21 +1718,56 @@ class MpvPlayerAdapter internal constructor(
     override fun toggleSecondaryAudioOutput(id: String) {
         if (id == MPV_AUTO_DEVICE || id == preferredAudioDevice) return
         coroutineScope.launch {
-            if (secondaryOutputIds.contains(id)) {
-                secondaryOutputIds.remove(id)
-                mirrorPlayers.remove(id)?.let { runCatching { it.release() } }
+            val resolvedId =
+                if (id.startsWith(WindowsBluetoothAudioHelper.BT_CONNECT_PREFIX)) {
+                    connectBluetoothSpeakerAndResolve(id) ?: run {
+                        readAudioOutputs()
+                        return@launch
+                    }
+                } else {
+                    id
+                }
+            if (resolvedId == preferredAudioDevice) {
+                readAudioOutputs()
+                return@launch
+            }
+            if (secondaryOutputIds.contains(resolvedId)) {
+                secondaryOutputIds.remove(resolvedId)
+                mirrorPlayers.remove(resolvedId)?.let { runCatching { it.release() } }
                 if (secondaryOutputIds.isEmpty()) {
                     mirrorDriftJob?.cancel()
                     mirrorDriftJob = null
                 }
             } else {
-                secondaryOutputIds.add(id)
-                spawnMirrorHandle(id)
+                secondaryOutputIds.add(resolvedId)
+                spawnMirrorHandle(resolvedId)
                 ensureMirrorDriftSyncRunning()
             }
             _secondaryAudioOutputIds.value = secondaryOutputIds.toSet()
             readAudioOutputs()
         }
+    }
+
+    private suspend fun connectBluetoothSpeakerAndResolve(syntheticId: String): String? {
+        val payload = syntheticId.removePrefix(WindowsBluetoothAudioHelper.BT_CONNECT_PREFIX)
+        val sep = payload.indexOf(':')
+        if (sep <= 0 || sep >= payload.lastIndex) return null
+        val mac = payload.substring(0, sep)
+        val endpointGuid = payload.substring(sep + 1)
+        val connected =
+            withContext(Dispatchers.IO) {
+                runCatching { bluetoothAudioConnector.connectSpeaker(mac, endpointGuid) }.getOrDefault(false)
+            }
+        if (!connected) return null
+        // Give WASAPI / mpv a brief moment to register the newly active render endpoint.
+        delay(350L)
+        readAudioOutputs()
+        val matched =
+            _audioOutputs.value.firstOrNull {
+                !it.id.startsWith(WindowsBluetoothAudioHelper.BT_CONNECT_PREFIX) &&
+                    it.id.contains(endpointGuid, ignoreCase = true)
+            }
+        return matched?.id ?: "wasapi/{0.0.0.00000000}.$endpointGuid"
     }
 
     override fun setAudioOutputDelayMs(
@@ -1876,10 +1928,27 @@ class MpvPlayerAdapter internal constructor(
         val driver = audioOutputDriver ?: return
         val json = handle.audioDeviceListJson() ?: return
         val activeSecondary = secondaryOutputIds.toSet()
-        _audioOutputs.value =
+        val liveOutputs =
             parseAudioOutputs(json, driver, handle.audioDevice()).map { out ->
                 if (out.id in activeSecondary) out.copy(isActive = true) else out
             }
+        val disconnectedBt =
+            if (playerFactory == null) {
+                runCatching { bluetoothAudioConnector.listDisconnectedSpeakers() }
+                    .getOrDefault(emptyList())
+                    .filter { spk -> liveOutputs.none { it.id.contains(spk.endpointGuid, ignoreCase = true) } }
+                    .map { spk ->
+                        AudioOutput(
+                            id = "${WindowsBluetoothAudioHelper.BT_CONNECT_PREFIX}${spk.mac}:${spk.endpointGuid}",
+                            name = spk.name,
+                            kind = AudioOutputKind.BLUETOOTH,
+                            isActive = false,
+                        )
+                    }
+            } else {
+                emptyList()
+            }
+        _audioOutputs.value = liveOutputs + disconnectedBt
     }
 
     // ========== Listener Management ==========
